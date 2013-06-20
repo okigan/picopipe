@@ -113,8 +113,8 @@ if __name__ == '__main__':
 
 
 def test():
-    assert [6] == Sum(1, 2, 3).process()
-    assert [6] == Multiply(1, 2, 3).process()
-    assert [3] == Max(1, 2, 3).process()
+    assert 6 == Sum(1, 2, 3).process()
+    assert 6 == Multiply(1, 2, 3).process()
+    assert 3 == Max(1, 2, 3).process()
 
 
