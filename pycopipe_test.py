@@ -16,12 +16,17 @@ class Pipeline(object):
         self.args = args
         self.kwargs = kwargs
 
-    # yeilds sub-pipelines or result, the *last* yield value is processed as result  
-    def run():
+    def run(self, *args, **kwargs):
+        """
+        yeilds sub-pipelines or result, the *last* yield value is processed as result
+        """
         pass
 
-    # returns result
     def process(self):
+        """
+        returns result
+        :return:
+        """
         args = list(self.args)
         kwargs = self.kwargs
 
@@ -58,6 +63,7 @@ class Sum(Pipeline):
 class Max(Pipeline):
     def run(self, *values):
         dummy = yield max(*values)
+        pass
 
 class Multiply(Pipeline):
     def run(self, *values):
@@ -65,12 +71,14 @@ class Multiply(Pipeline):
         for v in values:
             result *= v
         dummy = yield result
+        pass
 
 class CompositePipeline(Pipeline):
     def run(self, *values):
         s = yield Sum(*values)
         m = yield Multiply(*values)
-        yield Max(s, m)
+        dummy = yield Max(s, m)
+        pass
 
 def gen_upper():
     value = yield
@@ -101,7 +109,7 @@ def main():
     except StopIteration:
         pass
 
-    c = CompositePipeline(1, 2, 3);
+    c = CompositePipeline(1, 2, 3)
     dummy = c.process()
     print dummy
 
