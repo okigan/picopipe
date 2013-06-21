@@ -1,5 +1,6 @@
 import sys
 import time
+import multiprocessing
 
 class FutureResult(object):
     def __init__(self, pipeline):
@@ -11,11 +12,30 @@ class FutureResult(object):
         self.materialized = True
         return self.value
 
+    def ismaterialized(self):
+        return self.materialized
+
+    def count_dependencies(self):
+        if self.materialized:
+            return 0
+
+        dependencies = list(self.pipeline.args) + self.pipeline.kwargs.values()
+        frs = filter(lambda x: isinstance(x, FutureResult), dependencies)
+        frs = filter(lambda x: False == x.ismaterialized(), frs)
+
+        #recurse
+        sub_dependencies_count = map(FutureResult.count_dependencies, frs)
+        return len(frs) + sum(sub_dependencies_count)
+
+def future_result_materialize_helper(x):
+    return x.materialize()
+
 
 class Pipeline(object):
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self.pool = None
 
     def run(self, *args, **kwargs):
         """
@@ -25,32 +45,40 @@ class Pipeline(object):
 
     def process(self):
         """
-        returns result
+        calls run() and executes yielded pipelines (as needed)
         :return:
         """
         args = list(self.args)
-        kwargs = self.kwargs
+        kwargs = dict(self.kwargs)
 
-        # Future result must be realized by now, replace them with actual values
+        # Future result must have been materialized by now, replace them with actual values
         args = [v.value if isinstance(v, FutureResult) else v for v in args]
+        # todo -- add the same for kwargs
 
         g = self.run(*args, **kwargs)
-        fr = None
 
-        results = []
-        if g is None:
-            results += [None]
-        else:
-            try:
-                while True:
-                    result = g.send(fr)
-                    fr = FutureResult(result) if isinstance(result, Pipeline) else None
-                    results += [result] if fr is None else [fr]  
-            except StopIteration:
-                pass
+        fr = None
+        results = [None] if g is None else []
+        try:
+            while g is not None:
+                result = g.send(fr)
+                fr = FutureResult(result) if isinstance(result, Pipeline) else None
+                results += [result] if fr is None else [fr]  
+        except StopIteration:
+            pass
 
         frs = filter(lambda x: isinstance(x, FutureResult),  results)
-        map(FutureResult.materialize, frs)
+
+        if self.pool is None:
+            frs = map(future_result_materialize_helper, frs)
+        else:
+            while any(not x.ismaterialized() for x in frs):
+                parallel = filter(lambda x: 0 == x.count_dependencies(), frs)
+                parallel_results  = self.pool.map(future_result_materialize_helper, parallel)
+
+                for idx, p in enumerate(parallel):
+                    p.value = parallel_results[idx]
+                    p.materialized = True
 
         result = results[-1]
         if isinstance(result, FutureResult):
@@ -58,14 +86,17 @@ class Pipeline(object):
         else:
             return result
 
+
 class Sum(Pipeline):
     def run(self, *values):
         dummy = yield sum(values)
+
 
 class Max(Pipeline):
     def run(self, *values):
         dummy = yield max(*values)
         pass
+
 
 class Multiply(Pipeline):
     def run(self, *values):
@@ -75,12 +106,22 @@ class Multiply(Pipeline):
         dummy = yield result
         pass
 
+
 class CompositePipeline(Pipeline):
     def run(self, *values):
         s = yield Sum(*values)
         m = yield Multiply(*values)
         dummy = yield Max(s, m)
         pass
+
+
+class DoubleCompositePipeline(Pipeline):
+    def run(self, *values):
+        s = yield CompositePipeline(*values)
+        m = yield CompositePipeline(*values)
+        dummy = yield Max(s, m)
+        pass
+
 
 class SleepPipeline(Pipeline):
     def run(self, sleep_time):
@@ -89,12 +130,14 @@ class SleepPipeline(Pipeline):
         print self, "done sleeping"
         pass
 
+
 class LongProcessingPipeline(Pipeline):
     def run(self, task_number, processing_time):
         for i in xrange(task_number):
             dummy = yield SleepPipeline(processing_time)
             pass
         pass
+
 
 def gen_upper():
     value = yield
@@ -106,6 +149,7 @@ def gen_xxxx():
     value = yield 1
     value = yield 2
     pass
+
 
 
 def main():
@@ -126,23 +170,33 @@ def main():
         pass
 
     c = CompositePipeline(1, 2, 3)
-    dummy = c.process()
-    print dummy
+    result = c.process()
+    print result
 
-    c = LongProcessingPipeline(2, 10)
-    dummy = c.process()
-    print dummy
+    c = DoubleCompositePipeline(1, 2, 3)
+    c.pool = multiprocessing.Pool(2)
+    result = c.process()
+    print result
+
+    c = LongProcessingPipeline(2, 3)
+    c.pool = multiprocessing.Pool(2)
+    result = c.process()
+    print result
 
     return 0
 
 
-if __name__ == '__main__':
-    sys.exit(main())
-
-
 def test():
+
+    # basic stuff
     assert 6 == Sum(1, 2, 3).process()
     assert 6 == Multiply(1, 2, 3).process()
     assert 3 == Max(1, 2, 3).process()
 
+    fr1 = FutureResult(Sum(1, 2, 3))
+    assert 0 == fr1.count_dependencies()
+    fr2 = FutureResult(Sum(fr1))
+    assert 1 == fr2.count_dependencies()
 
+if __name__ == '__main__':
+    sys.exit(main())
