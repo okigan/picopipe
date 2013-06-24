@@ -68,7 +68,7 @@ class Pipeline(object):
             pass
 
         frs = filter(lambda x: isinstance(x, FutureResult),  results)
-
+        
         if self.pool is None:
             frs = map(future_result_materialize_helper, frs)
         else:
@@ -122,6 +122,28 @@ class DoubleCompositePipeline(Pipeline):
         dummy = yield Max(s, m)
         pass
 
+class RecursivePipeline(Pipeline):
+    def run(self, levels, value_to_return):
+        if levels > 0:
+            dummy = yield RecursivePipeline(levels - 1, value_to_return)
+        else:
+            dummy = yield value_to_return
+        pass
+
+
+class ComplexPipeline(Pipeline):
+    def __init__(self, width, depth, value_to_return):
+        return super(ComplexPipeline, self).__init__(width, depth, value_to_return)
+    
+    
+    def run(self, width, depth, value_to_return):
+        if depth > 0:
+            for i in xrange(width):
+                dummy = yield ComplexPipeline(width, depth - 1, value_to_return)
+        else:
+            dummy = yield value_to_return
+        pass
+
 
 class SleepPipeline(Pipeline):
     def run(self, sleep_time):
@@ -153,6 +175,9 @@ def gen_xxxx():
 
 
 def main():
+    assert 127 == ComplexPipeline(2, 2, 127).process()
+
+
     s = "Hello World"
 
     g = gen_upper()
@@ -174,12 +199,12 @@ def main():
     print result
 
     c = DoubleCompositePipeline(1, 2, 3)
-    c.pool = multiprocessing.Pool(2)
+    #c.pool = multiprocessing.Pool(2)
     result = c.process()
     print result
 
     c = LongProcessingPipeline(2, 3)
-    c.pool = multiprocessing.Pool(2)
+    #c.pool = multiprocessing.Pool(2)
     result = c.process()
     print result
 
@@ -197,6 +222,11 @@ def test():
     assert 0 == fr1.count_dependencies()
     fr2 = FutureResult(Sum(fr1))
     assert 1 == fr2.count_dependencies()
+
+
+    assert 127 == RecursivePipeline(100, 127).process()
+
+    assert 127 == ComplexPipeline(2, 2, 127).process()
 
 if __name__ == '__main__':
     sys.exit(main())
