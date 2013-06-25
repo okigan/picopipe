@@ -258,20 +258,11 @@ def main():
     width = 2
     depth = 1
     sleep_time = 2
-    pool = None
-    sw = StopWatch(True)
-    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process()
-    sw.stop()
-    assert abs(sw.duration() - width*sleep_time) < 0.1
-
-    width = 2
-    depth = 1
-    sleep_time = 2
     pool = multiprocessing.Pool()
     sw = StopWatch(True)
-    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
+    result = ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
     sw.stop()
-    assert abs(sw.duration() - sleep_time) < 0.1
+    print result
 
     return 0
 
@@ -291,6 +282,24 @@ def test():
     assert 127 == ComplexPipeline(1, 100, 127).process()
     assert 127 == ComplexPipeline(2, 2, 127).process()
 
+
+    width = 2
+    depth = 1
+    sleep_time = 2
+    pool = None
+    sw = StopWatch(True)
+    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process()
+    sw.stop()
+    assert abs(sw.duration() - width*sleep_time) < 0.1
+
+    width = 2
+    depth = 1
+    sleep_time = 2
+    pool = multiprocessing.Pool()
+    sw = StopWatch(True)
+    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
+    sw.stop()
+    assert abs(sw.duration() - sleep_time) < 0.1
 
 if __name__ == '__main__':
     sys.exit(main())
