@@ -1,16 +1,29 @@
 import sys
 import time
+import collections
+import itertools
+import inspect 
 import multiprocessing
 
 class FutureResult(object):
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self.materialized = False
+        self.value = None
+        self.debug_frameinfo = inspect.getframeinfo(inspect.currentframe())
+        self.debug_stack = inspect.stack()
+
+    def __repr__(self):
+        return "%s, [%s]" % (self.materialized, self.value)
 
     def materialize(self):
         self.value = self.pipeline.process()
         self.materialized = True
         return self.value
+
+    def set(self, value):
+        self.value = value
+        self.materialized = True
 
     def ismaterialized(self):
         return self.materialized
@@ -27,8 +40,36 @@ class FutureResult(object):
         sub_dependencies_count = map(FutureResult.count_dependencies, frs)
         return len(frs) + sum(sub_dependencies_count)
 
+
 def future_result_materialize_helper(x):
     return x.materialize()
+
+
+def isingle(item):
+  u"iterator that yields only a single value then stops, for chaining"
+  yield item
+
+class Tree:
+    def __init__(self, value):
+        self.value = value
+        self.children = []
+        self.populated = False
+        
+    def __iter__(self):
+        u"implement the iterator protocol"
+        return itertools.chain(isingle(self.value), *map(iter, self.children))
+
+    def iternodes(self):
+        return itertools.chain(isingle(self), *map(Tree.iternodes, self.children))
+
+    def append(self, value):
+        self.children.append(Tree(value))
+
+    def last_child(self):
+        if len(self.children):
+            return self.children[-1]
+        else:
+            return None
 
 
 class Pipeline(object):
@@ -43,49 +84,54 @@ class Pipeline(object):
         """
         pass
 
+
     def process(self):
-        """
-        calls run() and executes yielded pipelines (as needed)
-        :return:
-        """
-        args = list(self.args)
-        kwargs = dict(self.kwargs)
-
-        # Future result must have been materialized by now, replace them with actual values
-        args = [v.value if isinstance(v, FutureResult) else v for v in args]
-        # todo -- add the same for kwargs
-
-        g = self.run(*args, **kwargs)
-
-        fr = None
-        results = [None] if g is None else []
-        try:
-            while g is not None:
-                result = g.send(fr)
-                fr = FutureResult(result) if isinstance(result, Pipeline) else None
-                results += [result] if fr is None else [fr]  
-        except StopIteration:
-            pass
-
-        frs = filter(lambda x: isinstance(x, FutureResult),  results)
+        processing_tree = Tree(FutureResult(self))
         
-        if self.pool is None:
-            frs = map(future_result_materialize_helper, frs)
-        else:
-            while any(not x.ismaterialized() for x in frs):
-                parallel = filter(lambda x: 0 == x.count_dependencies(), frs)
-                parallel_results  = self.pool.map(future_result_materialize_helper, parallel)
+        state_changed = True
+        while state_changed:
+            state_changed = False
+            for node in processing_tree.iternodes():
+                if isinstance(node.value, FutureResult):
+                    if not node.populated:
+                        pipeline = node.value.pipeline
+                        args,kwargs = list(pipeline.args),dict(pipeline.kwargs)
 
-                for idx, p in enumerate(parallel):
-                    p.value = parallel_results[idx]
-                    p.materialized = True
+                        frs = filter(lambda x: isinstance(x, FutureResult),  args)
+                        dependencies_status = map(lambda x: x.ismaterialized(), frs)
 
-        result = results[-1]
-        if isinstance(result, FutureResult):
-            return result.value
-        else:
-            return result
+                        if not all(dependencies_status):
+                            continue
 
+                        generator = pipeline.run(*args, **kwargs)
+                        fr = None
+                        #pt[pipeline] = [None] if generator is None else []
+                        try:
+                            while generator is not None:
+                                result = generator.send(fr)
+                                if isinstance(result, Pipeline):
+                                    fr = FutureResult(result)
+                                    node.append(fr)
+                                elif isinstance(result, FutureResult):
+                                    assert result.ismaterialized()
+                                    fr = None
+                                    node.value.set(result.value)
+                                else:
+                                    fr = None
+                                    node.value.set(result)
+                                state_changed = True
+                        except StopIteration:
+                            print 'StopIteration'
+                        node.populated = True
+                    elif not node.value.ismaterialized():
+                        frs = filter(lambda x: isinstance(x.value, FutureResult),  node.children)
+                        dependencies_status = map(lambda x: x.value.ismaterialized(), frs)
+                        if all(dependencies_status):
+                            node.value.set(node.last_child().value.value)
+                            state_changed = True
+                else:
+                    print 'Unexpected'
+        return processing_tree.value.value
 
 class Sum(Pipeline):
     def run(self, *values):
@@ -175,9 +221,6 @@ def gen_xxxx():
 
 
 def main():
-    assert 127 == ComplexPipeline(2, 2, 127).process()
-
-
     s = "Hello World"
 
     g = gen_upper()
@@ -223,10 +266,9 @@ def test():
     fr2 = FutureResult(Sum(fr1))
     assert 1 == fr2.count_dependencies()
 
-
     assert 127 == RecursivePipeline(100, 127).process()
-
     assert 127 == ComplexPipeline(2, 2, 127).process()
+
 
 if __name__ == '__main__':
     sys.exit(main())
