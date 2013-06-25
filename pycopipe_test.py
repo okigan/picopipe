@@ -44,11 +44,6 @@ class FutureResult(object):
 def future_result_materialize_helper(x):
     return x.materialize()
 
-
-def isingle(item):
-  u"iterator that yields only a single value then stops, for chaining"
-  yield item
-
 class Tree:
     def __init__(self, value):
         self.value = value
@@ -60,7 +55,7 @@ class Tree:
         return itertools.chain(isingle(self.value), *map(iter, self.children))
 
     def iternodes(self):
-        return itertools.chain(isingle(self), *map(Tree.iternodes, self.children))
+        return itertools.chain(self._isingle(self), *map(Tree.iternodes, self.children))
 
     def append(self, value):
         self.children.append(Tree(value))
@@ -70,6 +65,11 @@ class Tree:
             return self.children[-1]
         else:
             return None
+
+    @staticmethod
+    def _isingle(item):
+      u"iterator that yields only a single value then stops, for chaining"
+      yield item
 
 
 class Pipeline(object):
@@ -85,7 +85,7 @@ class Pipeline(object):
         pass
 
 
-    def process(self):
+    def process(self, pool=None):
         processing_tree = Tree(FutureResult(self))
         
         state_changed = True
@@ -105,7 +105,7 @@ class Pipeline(object):
 
                         generator = pipeline.run(*args, **kwargs)
                         fr = None
-                        #pt[pipeline] = [None] if generator is None else []
+
                         try:
                             while generator is not None:
                                 result = generator.send(fr)
@@ -121,7 +121,9 @@ class Pipeline(object):
                                     node.value.set(result)
                                 state_changed = True
                         except StopIteration:
-                            print 'StopIteration'
+                            #print 'StopIteration'
+                            pass
+
                         node.populated = True
                     elif not node.value.ismaterialized():
                         frs = filter(lambda x: isinstance(x.value, FutureResult),  node.children)
@@ -168,19 +170,10 @@ class DoubleCompositePipeline(Pipeline):
         dummy = yield Max(s, m)
         pass
 
-class RecursivePipeline(Pipeline):
-    def run(self, levels, value_to_return):
-        if levels > 0:
-            dummy = yield RecursivePipeline(levels - 1, value_to_return)
-        else:
-            dummy = yield value_to_return
-        pass
-
 
 class ComplexPipeline(Pipeline):
     def __init__(self, width, depth, value_to_return):
         return super(ComplexPipeline, self).__init__(width, depth, value_to_return)
-    
     
     def run(self, width, depth, value_to_return):
         if depth > 0:
@@ -218,7 +211,23 @@ def gen_xxxx():
     value = yield 2
     pass
 
+class StopWatch(object):
+    def __init__(self, autostart=False):
+        self.start_time = None
+        self.stop_time  = None
 
+        if autostart:
+            self.start()
+
+    def start(self):
+        self.start_time = time.time()
+
+    def stop(self):
+        self.stop_time = time.time()
+    
+    def duration(self):
+        duration = self.stop_time - self.start_time
+        return duration
 
 def main():
     s = "Hello World"
@@ -246,10 +255,23 @@ def main():
     result = c.process()
     print result
 
-    c = LongProcessingPipeline(2, 3)
-    #c.pool = multiprocessing.Pool(2)
-    result = c.process()
-    print result
+    width = 2
+    depth = 1
+    sleep_time = 2
+    pool = None
+    sw = StopWatch(True)
+    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process()
+    sw.stop()
+    assert abs(sw.duration() - width*sleep_time) < 0.1
+
+    width = 2
+    depth = 1
+    sleep_time = 2
+    pool = multiprocessing.Pool()
+    sw = StopWatch(True)
+    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
+    sw.stop()
+    assert abs(sw.duration() - sleep_time) < 0.1
 
     return 0
 
@@ -266,7 +288,7 @@ def test():
     fr2 = FutureResult(Sum(fr1))
     assert 1 == fr2.count_dependencies()
 
-    assert 127 == RecursivePipeline(100, 127).process()
+    assert 127 == ComplexPipeline(1, 100, 127).process()
     assert 127 == ComplexPipeline(2, 2, 127).process()
 
 
