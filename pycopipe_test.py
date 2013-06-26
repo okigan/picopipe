@@ -1,6 +1,5 @@
 import sys
 import time
-import collections
 import itertools
 import inspect 
 import multiprocessing
@@ -8,7 +7,7 @@ import multiprocessing
 class FutureResult(object):
     def __init__(self, pipeline):
         self.pipeline = pipeline
-        self.materialized = False
+        self._materialized = False
         self.value = None
         self.debug_frameinfo = inspect.getframeinfo(inspect.currentframe())
         self.debug_stack = inspect.stack()
@@ -18,18 +17,18 @@ class FutureResult(object):
 
     def materialize(self):
         self.value = self.pipeline.process()
-        self.materialized = True
+        self._materialized = True
         return self.value
 
     def set(self, value):
         self.value = value
-        self.materialized = True
+        self._materialized = True
 
     def ismaterialized(self):
-        return self.materialized
+        return self._materialized
 
     def count_dependencies(self):
-        if self.materialized:
+        if self._materialized:
             return 0
 
         dependencies = list(self.pipeline.args) + self.pipeline.kwargs.values()
@@ -45,20 +44,21 @@ def future_result_materialize_helper(x):
     return x.materialize()
 
 class Tree:
-    def __init__(self, value):
+    def __init__(self, value, populated=False):
         self.value = value
+        self.populated = populated
         self.children = []
-        self.populated = False
         
     def __iter__(self):
         u"implement the iterator protocol"
-        return itertools.chain(isingle(self.value), *map(iter, self.children))
+        return itertools.chain(self._isingle(self.value), *map(iter, self.children))
 
     def iternodes(self):
         return itertools.chain(self._isingle(self), *map(Tree.iternodes, self.children))
 
     def append(self, value):
         self.children.append(Tree(value))
+        return self.last_child()
 
     def last_child(self):
         if len(self.children):
@@ -68,8 +68,8 @@ class Tree:
 
     @staticmethod
     def _isingle(item):
-      u"iterator that yields only a single value then stops, for chaining"
-      yield item
+        u"iterator that yields only a single value then stops, for chaining"
+        yield item
 
 
 class Pipeline(object):
@@ -82,8 +82,48 @@ class Pipeline(object):
         """
         yeilds sub-pipelines or result, the *last* yield value is processed as result
         """
+        assert False
         pass
 
+
+
+    def _process_one_step(self, pipeline):
+        u"Process a step of the pipeline, return sub-pipelines and/or wrapped values"
+        
+        state_changed = False
+        results = []
+        
+        #replace args FutureResults with values
+        #TODO do the same for kwargs
+        args, kwargs = list(pipeline.args), dict(pipeline.kwargs)
+        frs = filter(lambda x:isinstance(x, FutureResult), args)
+        dependencies_status = map(lambda x:x.ismaterialized(), frs)
+        for idx, x in enumerate(args):
+            if isinstance(x, FutureResult):
+                if x.ismaterialized():
+                    args[idx] = x.value
+        
+        if all(dependencies_status):
+            fr = None
+            generator = pipeline.run(*args, **kwargs)
+            try:
+                while generator is not None:
+                    result = generator.send(fr)
+                    if isinstance(result, Pipeline):
+                        fr = FutureResult(result)
+                    else:
+                        fr = FutureResult(None)
+                        fr.set(result)
+                    results.append(fr)
+                    if fr.pipeline == None:
+                        fr = None
+                    state_changed = True
+            
+            except StopIteration:
+                #print 'StopIteration'
+                pass
+                
+        return state_changed, results
 
     def process(self, pool=None):
         processing_tree = Tree(FutureResult(self))
@@ -94,35 +134,12 @@ class Pipeline(object):
             for node in processing_tree.iternodes():
                 if isinstance(node.value, FutureResult):
                     if not node.populated:
-                        pipeline = node.value.pipeline
-                        args,kwargs = list(pipeline.args),dict(pipeline.kwargs)
-
-                        frs = filter(lambda x: isinstance(x, FutureResult),  args)
-                        dependencies_status = map(lambda x: x.ismaterialized(), frs)
-
-                        if not all(dependencies_status):
-                            continue
-
-                        generator = pipeline.run(*args, **kwargs)
-                        fr = None
-
-                        try:
-                            while generator is not None:
-                                result = generator.send(fr)
-                                if isinstance(result, Pipeline):
-                                    fr = FutureResult(result)
-                                    node.append(fr)
-                                elif isinstance(result, FutureResult):
-                                    assert result.ismaterialized()
-                                    fr = None
-                                    node.value.set(result.value)
-                                else:
-                                    fr = None
-                                    node.value.set(result)
-                                state_changed = True
-                        except StopIteration:
-                            #print 'StopIteration'
-                            pass
+                        state_changed, results  = self._process_one_step(node.value.pipeline)
+    
+                        for r in results:
+                            child = node.append(r)
+                            if r.pipeline == None:
+                                child.populated = True
 
                         node.populated = True
                     elif not node.value.ismaterialized():
@@ -177,7 +194,7 @@ class ComplexPipeline(Pipeline):
     
     def run(self, width, depth, value_to_return):
         if depth > 0:
-            for i in xrange(width):
+            for _ in xrange(width):
                 dummy = yield ComplexPipeline(width, depth - 1, value_to_return)
         else:
             dummy = yield value_to_return
@@ -194,7 +211,7 @@ class SleepPipeline(Pipeline):
 
 class LongProcessingPipeline(Pipeline):
     def run(self, task_number, processing_time):
-        for i in xrange(task_number):
+        for _ in xrange(task_number):
             dummy = yield SleepPipeline(processing_time)
             pass
         pass
@@ -207,8 +224,8 @@ def gen_upper():
 
 
 def gen_xxxx():
-    value = yield 1
-    value = yield 2
+    _ = yield 1
+    _ = yield 2
     pass
 
 class StopWatch(object):
@@ -230,6 +247,7 @@ class StopWatch(object):
         return duration
 
 def main():
+    test()
     s = "Hello World"
 
     g = gen_upper()
@@ -291,6 +309,8 @@ def test():
     assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process()
     sw.stop()
     assert abs(sw.duration() - width*sleep_time) < 0.1
+
+    return 
 
     width = 2
     depth = 1
