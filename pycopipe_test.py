@@ -1,53 +1,68 @@
+
 import sys
 import time
 import itertools
-import inspect 
+import inspect
+import threading
 import multiprocessing
-
-class FutureResult(object):
-    def __init__(self, pipeline):
-        self.pipeline = pipeline
-        self._materialized = False
-        self.value = None
-        self.debug_frameinfo = inspect.getframeinfo(inspect.currentframe())
-        self.debug_stack = inspect.stack()
-
-    def __repr__(self):
-        return "%s, [%s]" % (self.materialized, self.value)
-
-    def materialize(self):
-        self.value = self.pipeline.process()
-        self._materialized = True
-        return self.value
-
-    def set(self, value):
-        self.value = value
-        self._materialized = True
-
-    def ismaterialized(self):
-        return self._materialized
-
-    def count_dependencies(self):
-        if self._materialized:
-            return 0
-
-        dependencies = list(self.pipeline.args) + self.pipeline.kwargs.values()
-        frs = filter(lambda x: isinstance(x, FutureResult), dependencies)
-        frs = filter(lambda x: False == x.ismaterialized(), frs)
-
-        #recurse
-        sub_dependencies_count = map(FutureResult.count_dependencies, frs)
-        return len(frs) + sum(sub_dependencies_count)
+import cProfile
+import pycallgraph 
 
 
-def future_result_materialize_helper(x):
-    return x.materialize()
+def _process_one_step(pipeline):
+    u"Process a step of the pipeline, return sub-pipelines and/or wrapped values"
+    
+    state_changed = False
+    results = []
+    
+    #replace args FutureResults with values
+    #TODO do the same for kwargs
+    args, kwargs = list(pipeline.args), dict(pipeline.kwargs)
+    frs = filter(lambda x:isinstance(x, FutureResult), args)
+    dependencies_status = map(lambda x:x.ready(), frs)
+    
+    if all(dependencies_status):
+        for idx, x in enumerate(args):
+            if isinstance(x, FutureResult):
+                if x.ready():
+                    args[idx] = x.value
+                else:
+                    assert False
+                    return "not all dependencies ready yet"
 
-class Tree:
-    def __init__(self, value, populated=False):
-        self.value = value
-        self.populated = populated
+        fr = None
+        generator = pipeline.run(*args, **kwargs)
+        try:
+            #print "yahoo"
+
+            while generator is not None:
+                result = generator.send(fr)
+                if isinstance(result, Pipeline):
+                    fr = FutureResult(result)
+                else:
+                    fr = FutureResult(None)
+                    fr.set(result)
+                results.append(fr)
+                if fr.pipeline == None:
+                    fr = None
+                state_changed = True
+        
+        except StopIteration:
+            #print 'StopIteration'
+            pass
+            
+    return results
+
+class FutureResultState:
+    NEW = 0
+    POPULATING = 1
+    POPULATED = 2
+
+
+class Tree(object):
+    def __init__(self, text=''):
         self.children = []
+        self._text = text
         
     def __iter__(self):
         u"implement the iterator protocol"
@@ -57,7 +72,8 @@ class Tree:
         return itertools.chain(self._isingle(self), *map(Tree.iternodes, self.children))
 
     def append(self, value):
-        self.children.append(Tree(value))
+        self.children.append(value)
+
         return self.last_child()
 
     def last_child(self):
@@ -66,17 +82,103 @@ class Tree:
         else:
             return None
 
+    @property
+    def text(self):
+        return self._text
+
     @staticmethod
     def _isingle(item):
         u"iterator that yields only a single value then stops, for chaining"
         yield item
 
+class FutureResult(Tree):
+    def __init__(self, pipeline, note=''):
+        super(FutureResult, self).__init__('asdf')
+        self.pipeline = pipeline
+        self.value = None
+        self._ready = False
+        self._state = FutureResultState.NEW
+        self._note = note
+        #self.debug_frameinfo = inspect.getframeinfo(inspect.currentframe())
+        #self.debug_stack = inspect.stack()
+
+    def __repr__(self):
+        return "%s, [%s]" % (self._ready, self.value)
+
+    #def materialize(self):
+    #    self.value = self.pipeline.process()
+    #    self._ready = True
+    #    return self.value
+
+    def set(self, value):
+        self.value = value
+        self._ready = True
+
+    def ready(self):
+        return self._ready
+
+    def count_dependencies(self):
+        if self._ready:
+            return 0
+
+        dependencies = list(self.pipeline.args) + self.pipeline.kwargs.values()
+        frs = filter(lambda x: isinstance(x, FutureResult), dependencies)
+        frs = filter(lambda x: False == x.ready(), frs)
+
+        #recurse
+        sub_dependencies_count = map(FutureResult.count_dependencies, frs)
+        return len(frs) + sum(sub_dependencies_count)
+    
+    def note(self):
+        return self._note
+    
+    @property
+    def state(self):
+        return self._state
+    
+    @state.setter
+    def state(self, value):
+        'setting'
+        self._state = value
+
+
+    
+def square_me(x):
+    return x*x    
+
+class AsyncResult(object):
+    def __init__(self):
+        self._result = None
+
+    def get(self, timeout=0):
+        return self._result
+
+    def wait(self, timeout):
+        return
+
+    def ready(self):
+        return True
+
+    def successful(self):
+        return True
+    
+    def _set(self, result):
+        self._result = result
+            
+    
+class FakePool(object):
+    def __init__(self):
+        pass
+    
+    def apply_async(self, func, args):
+        result = AsyncResult()
+        result._set(func(*args))
+        return result
 
 class Pipeline(object):
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
-        self.pool = None
 
     def run(self, *args, **kwargs):
         """
@@ -86,71 +188,56 @@ class Pipeline(object):
         pass
 
 
-
-    def _process_one_step(self, pipeline):
-        u"Process a step of the pipeline, return sub-pipelines and/or wrapped values"
+    def process(self, pool=FakePool()):
+        #pool = multiprocessing.Pool(processes = 4)
+        #pool = threading.
         
-        state_changed = False
-        results = []
-        
-        #replace args FutureResults with values
-        #TODO do the same for kwargs
-        args, kwargs = list(pipeline.args), dict(pipeline.kwargs)
-        frs = filter(lambda x:isinstance(x, FutureResult), args)
-        dependencies_status = map(lambda x:x.ismaterialized(), frs)
-        for idx, x in enumerate(args):
-            if isinstance(x, FutureResult):
-                if x.ismaterialized():
-                    args[idx] = x.value
-        
-        if all(dependencies_status):
-            fr = None
-            generator = pipeline.run(*args, **kwargs)
-            try:
-                while generator is not None:
-                    result = generator.send(fr)
-                    if isinstance(result, Pipeline):
-                        fr = FutureResult(result)
-                    else:
-                        fr = FutureResult(None)
-                        fr.set(result)
-                    results.append(fr)
-                    if fr.pipeline == None:
-                        fr = None
-                    state_changed = True
-            
-            except StopIteration:
-                #print 'StopIteration'
-                pass
-                
-        return state_changed, results
-
-    def process(self, pool=None):
-        processing_tree = Tree(FutureResult(self))
+        processing_tree = FutureResult(self, note='root')
         
         state_changed = True
         while state_changed:
             state_changed = False
-            for node in processing_tree.iternodes():
-                if isinstance(node.value, FutureResult):
-                    if not node.populated:
-                        state_changed, results  = self._process_one_step(node.value.pipeline)
-    
-                        for r in results:
-                            child = node.append(r)
-                            if r.pipeline == None:
-                                child.populated = True
 
-                        node.populated = True
-                    elif not node.value.ismaterialized():
-                        frs = filter(lambda x: isinstance(x.value, FutureResult),  node.children)
-                        dependencies_status = map(lambda x: x.value.ismaterialized(), frs)
-                        if all(dependencies_status):
-                            node.value.set(node.last_child().value.value)
-                            state_changed = True
+            for node in processing_tree.iternodes():
+                if isinstance(node, FutureResult):
+                    if node.state == FutureResultState.NEW:
+                        #node.results = _process_one_step(node.pipeline)
+                        node.async_result = pool.apply_async(_process_one_step, (node.pipeline,))
+                        
+                        #for r in results:
+                        #    child = node.append(r)
+                        #    if r.pipeline == None:
+                        #        child.populated(True)
+
+                        node.state = FutureResultState.POPULATING
+                        state_changed = True
+                    elif node.state == FutureResultState.POPULATING:
+                        node.async_result.wait(0.1)
+                        if node.async_result.ready():
+                            node.results = node.async_result.get()
+                            for r in node.results:
+                                child = node.append(r)
+                                if r.pipeline == None:
+                                    child.state = FutureResultState.POPULATED
+
+                        #if r.pipeline == None:
+                            node.state = FutureResultState.POPULATED
+                        state_changed = True
+                    elif node.state == FutureResultState.POPULATED:
+                        if not node.ready():
+                            #node.async_result.wait(3)
+                            #if True: #node.async_result.ready():
+                                #state_changed, results = node.async_result.get()
+                                #state_changed, results = node.results
+
+                            dependencies_status = map(lambda x: x.ready(), node.children)
+                            if all(dependencies_status):
+                                node.set(node.last_child().value)
+                                state_changed = True
                 else:
                     print 'Unexpected'
-        return processing_tree.value.value
+
+        return processing_tree.value
 
 class Sum(Pipeline):
     def run(self, *values):
@@ -203,9 +290,11 @@ class ComplexPipeline(Pipeline):
 
 class SleepPipeline(Pipeline):
     def run(self, sleep_time):
-        print self, "started sleeping"
+        print time.time(), self, "started sleeping for", sleep_time, "seconds"
         time.sleep(sleep_time)
-        print self, "done sleeping"
+        print time.time(), self, "done sleeping"
+
+        yield None
         pass
 
 
@@ -247,46 +336,40 @@ class StopWatch(object):
         return duration
 
 def main():
-    test()
-    s = "Hello World"
+    #pycallgraph.start_trace()
+    test3()
+    #pycallgraph.make_dot_graph(r'C:\Users\iokulist\workspace\pycopipe\test.png')
+    #cProfile.run('test1()')
+    
+    #s = "Hello World"
 
-    g = gen_upper()
-    dummy = g.send(None)
+    #g = gen_upper()
+    #dummy = g.send(None)
 
-    for w in s.split():
-        print g.send(w)
+    #for w in s.split():
+    #    print g.send(w)
 
-    f = gen_xxxx()
-    try:
-        print f.send(None)
-        print f.send('a')
-        f.send('b')
-    except StopIteration:
-        pass
+    #f = gen_xxxx()
+    #try:
+    #    print f.send(None)
+    #    print f.send('a')
+    #    f.send('b')
+    #except StopIteration:
+    #    pass
 
-    c = CompositePipeline(1, 2, 3)
-    result = c.process()
-    print result
+    #c = CompositePipeline(1, 2, 3)
+    #result = c.process()
+    #print result
 
-    c = DoubleCompositePipeline(1, 2, 3)
-    #c.pool = multiprocessing.Pool(2)
-    result = c.process()
-    print result
-
-    width = 2
-    depth = 1
-    sleep_time = 2
-    pool = multiprocessing.Pool()
-    sw = StopWatch(True)
-    result = ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
-    sw.stop()
-    print result
+    #c = DoubleCompositePipeline(1, 2, 3)
+    ##c.pool = multiprocessing.Pool(2)
+    #result = c.process()
+    #print result
 
     return 0
 
 
-def test():
-
+def test1():
     # basic stuff
     assert 6 == Sum(1, 2, 3).process()
     assert 6 == Multiply(1, 2, 3).process()
@@ -300,26 +383,43 @@ def test():
     assert 127 == ComplexPipeline(1, 100, 127).process()
     assert 127 == ComplexPipeline(2, 2, 127).process()
 
-
-    width = 2
-    depth = 1
-    sleep_time = 2
+def test2():
+    width = 1
+    depth = 0
+    sleep_time = 4
     pool = None
     sw = StopWatch(True)
     assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process()
     sw.stop()
-    assert abs(sw.duration() - width*sleep_time) < 0.1
+    print 'Duration', sw.duration()
+    assert (sw.duration() - 0.1) < width*sleep_time
 
-    return 
+def test3():
+    
+    pools = [FakePool(), multiprocessing.Pool()]
+    durations = []
+    
+    for pool in pools:
+        width = 2
+        depth = 1
+        sleep_time = 4
+        sw = StopWatch(True)
+        assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
+        sw.stop()
+        
+        durations.append(sw.duration())
+        
+         
+    print durations 
+    
+    #suppose to run in parallel so just sleep_time, giving some slack for debugger/etc
+    scale = 1.8
+    assert durations[0] > durations[1] * scale
 
-    width = 2
-    depth = 1
-    sleep_time = 2
-    pool = multiprocessing.Pool()
-    sw = StopWatch(True)
-    assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
-    sw.stop()
-    assert abs(sw.duration() - sleep_time) < 0.1
+    
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     sys.exit(main())
+
+
