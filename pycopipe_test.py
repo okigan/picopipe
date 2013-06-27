@@ -6,7 +6,7 @@ import inspect
 import threading
 import multiprocessing
 import cProfile
-import pycallgraph 
+import pycallgraph
 
 
 def _process_one_step(pipeline):
