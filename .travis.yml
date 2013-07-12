@@ -9,4 +9,4 @@ install:
     - sudo rm -rf /dev/shm && sudo ln -s /run/shm /dev/shm
 # command to run tests
 script:
-    - nosetests pycopipe.py
+    - nosetests -v -v pycopipe.py

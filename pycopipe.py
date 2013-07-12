@@ -5,9 +5,12 @@ import itertools
 import inspect
 import threading
 import multiprocessing
+from multiprocessing.managers import SyncManager
+import Queue
 import cProfile
-import pycallgraph
-
+#import pycallgraph
+import uuid
+import pickle
 
 def _process_one_step(pipeline):
     u"Process a step of the pipeline, return sub-pipelines and/or wrapped values"
@@ -177,6 +180,67 @@ class FakePool(object):
         result._set(func(*args))
         return result
 
+class Job:
+    def __init__(self, function, *args, **kwargs):
+        self._uuid = uuid.uuid4()
+        self.args = args
+        self.kwargs = kwargs
+        self.function = function
+    
+    @property
+    def id(self):
+        return self._uuid
+    
+    def process():
+        self.function(*self.args, **self.kwargs)
+
+
+def read_result_q(result_q, job_id_event_map_lock, job_id_event_map):
+    while True:
+        job_id, result = result_q.get()
+        with job_id_event_map_lock:
+            async_result = job_id_event_map[job_id]
+            async_result.set(result)
+
+class QueueAsyncResult:
+    def __init__(self):
+        self._result = None
+        self._event = threading.Event()
+    
+    def get(self, timeout=0):
+        return self._result
+    
+    def wait(self, timeout):
+        self._event.wait(timeout)
+        return
+    
+    def ready(self):
+        return self._event.is_set()
+    
+    def successful(self):
+        return True
+    
+    def _set(self, result):
+        self._result = result
+        self._event.set()
+
+class QueueBasedPool(object):
+    def __init__(self, job_q, result_q):
+        self._job_q = job_q
+        self._result_q = result_q
+        self._job_id_event_map = {}
+        self._job_id_event_map_lock = threading.Lock()
+        self._worker_thread = threading.Thread(target=read_result_q, args = (self._result_q,self._job_id_event_map))
+    
+    def apply_async(self, func, args):
+        job = Job(func, args)
+        async_result = QueueAsyncResult()
+        with self._job_id_event_map_lock:
+            self._job_id_event_map[job.id] = async_result
+            self._job_q.put(job)
+        return async_result
+
+
 class Pipeline(object):
     def __init__(self, *args, **kwargs):
         self.args = args
@@ -193,8 +257,9 @@ class Pipeline(object):
         pass
 
     def process(self, pool=FakePool()):
-        
         processing_tree = FutureResult(self, note='root')
+        node_to_async_result_map = {}
+        #TODO: add toposort
         
         state_changed = True
         while state_changed:
@@ -202,31 +267,31 @@ class Pipeline(object):
 
             for node in processing_tree.iternodes():
                 if isinstance(node, FutureResult):
-                    if isinstance(node.pipeline, ComplexReductionPipeline):
-                        pass
-
                     if node.state == FutureResultState.NEW:
+                        #for debugging 
+                        #if isinstance(node.pipeline, Sum):
+                            #node.results = _process_one_step(node.pipeline)
+                            #print node.pipeline.args[0].pipeline
+                            #print node.pipeline.args
+                            #print dir(node.pipeline.args[0])
+                            #break
+                        
                         args, kwargs = list(node.pipeline.args), dict(node.pipeline.kwargs)
                         frs = filter(lambda x:isinstance(x, FutureResult), args)
                         dependencies_status = map(lambda x:x.ready(), frs)
     
                         if all(dependencies_status):
-                            #node.results = _process_one_step(node.pipeline)
-                            node.async_result = pool.apply_async(_process_one_step, (node.pipeline,))
-                        
-                            #for r in results:
-                            #    child = node.append(r)
-                            #    if r.pipeline == None:
-                            #        child.populated(True)
-
+                            node_to_async_result_map[node] = pool.apply_async(_process_one_step, (node.pipeline,))
                             node.state = FutureResultState.POPULATING
                             state_changed = True
                         
                     if node.state == FutureResultState.POPULATING:
-                        node.async_result.wait(0.1)
-                        if node.async_result.ready():
-                            results = node.async_result.get()
-
+                        async_result = node_to_async_result_map[node]
+                        async_result.wait(1)
+                        if async_result.ready():
+                            results = async_result.get()
+                            del node_to_async_result_map[node]
+                            
                             for r in results:
                                 child = node.append(r)
                                 if r.pipeline is None:
@@ -241,22 +306,18 @@ class Pipeline(object):
 
                         #if r.pipeline == None:
                             node.state = FutureResultState.POPULATED
-                            state_changed = True
+                        #keep the loop running while a job is thinking (could add timeout here)
+                        state_changed = True
                     
                     if node.state == FutureResultState.POPULATED:
                         if not node.ready():
-                            #node.async_result.wait(3)
-                            #if True: #node.async_result.ready():
-                                #state_changed, results = node.async_result.get()
-                                #state_changed, results = node.results
-
                             dependencies_status = map(lambda x: x.ready(), node.children)
                             if len(dependencies_status) == 0 or (len(dependencies_status) > 0 and all(dependencies_status)):
                                 node.set(node.last_child().value)
                                 state_changed = True
                                 node.pipeline.on_finished()
                 else:
-                    print 'Unexpected'
+                    print 'Unexpected pipeline state'
 
         return processing_tree.value
 
@@ -310,16 +371,15 @@ class ComplexPipeline(Pipeline):
 
 class ComplexReductionPipeline(Pipeline):
     def __init__(self, width, depth, value_to_return, reduction_class):
-        super(ComplexReductionPipeline, self).__init__(width, depth, value_to_return)
-        self.reduction_class = reduction_class
+        super(ComplexReductionPipeline, self).__init__(width, depth, value_to_return, reduction_class)
     
-    def run(self, width, depth, value_to_return):
+    def run(self, width, depth, value_to_return, reduction_class):
         if depth > 0:
             subvalues = []
             for _ in xrange(width):
-                subvalues += [(yield ComplexReductionPipeline(width, depth - 1, value_to_return, self.reduction_class))]
+                subvalues += [(yield ComplexReductionPipeline(width, depth - 1, value_to_return, reduction_class))]
             
-            yield self.reduction_class(*subvalues)
+            yield reduction_class(*subvalues)
         else:
             dummy = yield value_to_return
         pass
@@ -374,9 +434,103 @@ class StopWatch(object):
         duration = self.stop_time - self.start_time
         return duration
 
+def worker(job_q, result_q):
+    while True:
+        try:
+            job = job_q.get_nowait()
+            #print '%s got %s nums...' % (myname, job)
+            outdict = { 'in' : job, 'out' : job.args}
+            result_q.put(outdict)
+        #print '  %s done' % myname
+        except Queue.Empty:
+            return
+
+
+def make_server_manager(ip, port, secret):
+    """ Create a manager for the server, listening on the given port.
+        Return a manager object with get_job_q and get_result_q methods.
+        """
+    job_q = multiprocessing.Queue()
+    result_q = multiprocessing.Queue()
+    
+    # This is based on the examples in the official docs of multiprocessing.
+    # get_{job|result}_q return synchronized proxies for the actual Queue
+    # objects.
+    class JobQueueManager(SyncManager):
+        pass
+    
+    JobQueueManager.register('get_job_q', callable=lambda: job_q)
+    JobQueueManager.register('get_result_q', callable=lambda: result_q)
+    
+    manager = JobQueueManager(address=(ip, port), authkey=secret)
+    manager.start()
+    
+    print 'Server started at:', manager.address
+    return manager
+
+
+def make_client_manager(ip, port, secret):
+    """ Create a manager for a client. This manager connects to a server on the
+        given address and exposes the get_job_q and get_result_q methods for
+        accessing the shared queues from the server.
+        Return a manager object.
+        """
+    class ServerQueueManager(SyncManager):
+        pass
+    
+    ServerQueueManager.register('get_job_q')
+    ServerQueueManager.register('get_result_q')
+    
+    manager = ServerQueueManager(address=(ip, port), authkey=secret)
+    manager.connect()
+    
+    print 'Client connected to:', manager.address
+    return manager
+
+
 def main():
+    import optparse
+    
+    parser = optparse.OptionParser()
+    parser.add_option('--mode', help='Mode of the script: server/client/standalone', default='standalone')
+    parser.add_option('--ip', help='IP of server', default='127.0.0.1')
+    parser.add_option('--port', default=8080, type=int)
+    parser.add_option('--auth', default='changeme')
+
+    
+    options_obj, args = parser.parse_args()
+    options = vars(options_obj)
+    
+    print 'Options:', options
+    
+    if 'server' == options['mode']:
+        manager = make_server_manager(options['ip'], options['port'], options['auth'])
+        shared_job_q = manager.get_job_q()
+        shared_result_q = manager.get_result_q()
+        shared_job_q.put(Job(1))
+        shared_job_q.put(Job(2))
+        
+        outdict = shared_result_q.get()
+        print outdict
+        outdict = shared_result_q.get()
+        print outdict
+
+        manager.shutdown()
+    elif 'client' == options['mode']:
+        manager = make_client_manager(options['ip'], options['port'], options['auth'])
+        job_q = manager.get_job_q()
+        result_q = manager.get_result_q()
+
+        worker(job_q, result_q)
+    elif 'standalone' == options['mode']:
+        #test_fanout()
+        test_pool_results()
+    else:
+        print 'Uknown mode specified'
+        return -1
+
     #pycallgraph.start_trace()
-    test_fanout()
+
     #pycallgraph.make_dot_graph(r'C:\Users\iokulist\workspace\pycopipe\test.png')
     #cProfile.run('test1()')
     
@@ -408,7 +562,7 @@ def main():
     return 0
 
 
-def test1():
+def test_basic():
     # basic stuff
     assert 6 == Sum(1, 2, 3).process()
     assert 6 == Multiply(1, 2, 3).process()
@@ -422,7 +576,7 @@ def test1():
     assert 127 == ComplexPipeline(1, 100, 127).process()
     assert 127 == ComplexPipeline(2, 2, 127).process()
 
-def test2():
+def test_sleep_pipeline():
     width = 1
     depth = 0
     sleep_time = 4
@@ -433,8 +587,7 @@ def test2():
     print 'Duration', sw.duration()
     assert (sw.duration() - 0.1) < width*sleep_time
 
-def test3():
-    
+def test_pool_time():
     pools = [FakePool(), multiprocessing.Pool()]
     durations = []
     
@@ -447,18 +600,51 @@ def test3():
         sw.stop()
         
         durations.append(sw.duration())
-        
-         
-    print durations 
+    
+    print durations
     
     #suppose to run in parallel so just sleep_time, giving some slack for debugger/etc
+    scale = 1.4
+    assert durations[0] > (durations[1] * scale)
+
+def xxxtest_pool_results():
+    
+    manager = make_server_manager(ip='', port=65001, secret='hi')
+    job_q = manager.Queue()
+    result_q = manager.Queue()
+    
+    qb_pool = QueueBasedPool(job_q, result_q)
+    
+    pools = [qb_pool, FakePool(), multiprocessing.Pool(), multiprocessing.pool.ThreadPool()]
+    durations = []
+    results = []
+    
+    for pool in pools:
+        width = 4
+        depth = 3
+        sleep_time = 4
+        sw = StopWatch(True)
+        result = ComplexReductionPipeline(width, depth, 1, Sum).process(pool)
+        sw.stop()
+        
+        durations.append(sw.duration())
+        results.append(result)
+    
+    print durations
+    print results
+    #suppose to run in parallel so just sleep_time, giving some slack for debugger/etc
     scale = 1.8
-    assert durations[0] > durations[1] * scale
+    #assert durations[0] > durations[1] * scale
+
 
 def test_fanout():
+    pool = FakePool()
+    pool = multiprocessing.Pool(1)
+    #pool = multiprocessing.pool.ThreadPool()
     width = 4
     depth = 3
-    result = ComplexReductionPipeline(width, depth, 1, Sum).process()
+    result = ComplexReductionPipeline(width, depth, 1, Sum).process(pool)
+    #result = ComplexPipeline(width, depth, SleepPipeline(1)).process(pool)
     print result
     pass
 
