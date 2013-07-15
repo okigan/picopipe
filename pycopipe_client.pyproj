@@ -3,7 +3,7 @@
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <SchemaVersion>2.0</SchemaVersion>
-    <ProjectGuid>{357121a9-28c2-47b6-a397-93d87cf3d385}</ProjectGuid>
+    <ProjectGuid>{a7fdd380-67e5-4257-bc0d-c78cd90cf4a6}</ProjectGuid>
     <ProjectHome>.</ProjectHome>
     <StartupFile>pycopipe.py</StartupFile>
     <SearchPath>
@@ -13,7 +13,7 @@
     <Name>pycotest</Name>
     <RootNamespace>pycotest</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>--mode stanalone --auth hi</CommandLineArguments>
+    <CommandLineArguments>--mode client --auth hi</CommandLineArguments>
     <InterpreterPath />
     <InterpreterArguments />
   </PropertyGroup>

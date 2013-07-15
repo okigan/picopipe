@@ -1,4 +1,3 @@
-
 import sys
 import time
 import itertools
@@ -7,10 +6,11 @@ import threading
 import multiprocessing
 from multiprocessing.managers import SyncManager
 import Queue
-import cProfile
+#import cProfile
 #import pycallgraph
 import uuid
 import pickle
+
 
 def _process_one_step(pipeline):
     u"Process a step of the pipeline, return sub-pipelines and/or wrapped values"
@@ -86,6 +86,9 @@ class Tree(object):
             return self.children[-1]
         else:
             return None
+
+    def isleaf():
+        return 0 == len(self.children)
 
     @property
     def text(self):
@@ -181,12 +184,20 @@ class FakePool(object):
         return result
 
 class Job:
+    _id = 0
+
+    @staticmethod
+    def _next_job_id():
+        Job._id += 1
+        return Job._id
+        #return uuid.uuid4()
+
     def __init__(self, function, *args, **kwargs):
-        self._uuid = uuid.uuid4()
+        self._uuid = Job._next_job_id()
+        self.function = function
         self.args = args
         self.kwargs = kwargs
-        self.function = function
-    
+
     @property
     def id(self):
         return self._uuid
@@ -194,13 +205,19 @@ class Job:
     def process():
         self.function(*self.args, **self.kwargs)
 
+    def __str__(self):
+        return str(self._uuid) + ',' + str(self.function)
+
 
 def read_result_q(result_q, job_id_event_map_lock, job_id_event_map):
     while True:
         job_id, result = result_q.get()
+        if job_id is None:
+            break
+
         with job_id_event_map_lock:
             async_result = job_id_event_map[job_id]
-            async_result.set(result)
+            async_result._set(result)
 
 class QueueAsyncResult:
     def __init__(self):
@@ -208,6 +225,7 @@ class QueueAsyncResult:
         self._event = threading.Event()
     
     def get(self, timeout=0):
+        self.wait(timeout)
         return self._result
     
     def wait(self, timeout):
@@ -230,8 +248,10 @@ class QueueBasedPool(object):
         self._result_q = result_q
         self._job_id_event_map = {}
         self._job_id_event_map_lock = threading.Lock()
-        self._worker_thread = threading.Thread(target=read_result_q, args = (self._result_q,self._job_id_event_map))
-    
+        args = self._result_q, self._job_id_event_map_lock, self._job_id_event_map
+        self._worker_thread = threading.Thread(target=read_result_q, args=args)
+        self._worker_thread.start()
+
     def apply_async(self, func, args):
         job = Job(func, args)
         async_result = QueueAsyncResult()
@@ -239,6 +259,11 @@ class QueueBasedPool(object):
             self._job_id_event_map[job.id] = async_result
             self._job_q.put(job)
         return async_result
+
+    def request_stop(self):
+        pill = None, None
+        self._result_q.put(pill)
+        self._worker_thread.join()
 
 
 class Pipeline(object):
@@ -287,7 +312,7 @@ class Pipeline(object):
                         
                     if node.state == FutureResultState.POPULATING:
                         async_result = node_to_async_result_map[node]
-                        async_result.wait(1)
+                        #async_result.wait(1)
                         if async_result.ready():
                             results = async_result.get()
                             del node_to_async_result_map[node]
@@ -435,57 +460,76 @@ class StopWatch(object):
         return duration
 
 def worker(job_q, result_q):
-    while True:
+    sleeps = [1, 2, 4] # 4, 4, 4, 4, 4, 4, 4, 4, 10, 10, 10, 10, 20, 30, 60]
+    sleep_index = 0
+    while sleep_index < len(sleeps):
         try:
-            job = job_q.get_nowait()
-            #print '%s got %s nums...' % (myname, job)
-            outdict = { 'in' : job, 'out' : job.args}
-            result_q.put(outdict)
-        #print '  %s done' % myname
+            while True:
+                job = job_q.get_nowait()
+                print "Got job:", job
+                result = job.function(job.args[0][0])
+                comb = job.id, result
+                result_q.put(comb)
+                sleep_index = 0
         except Queue.Empty:
-            return
+            print "Got empty queue -- sleeping for {0} seconds".format(sleeps[sleep_index])
+            time.sleep(sleeps[sleep_index])
+            sleep_index+=1
+         
 
+# This is based on the examples in the official docs of multiprocessing.
+# get_{job|result}_q return synchronized proxies for the actual Queue
+# objects.
+class JobQueueManager(SyncManager):
+    pass
 
-def make_server_manager(ip, port, secret):
+class Returner(object):
+    def __init__(self, value):
+        self._value = value
+    def __call__(self):
+        return self._value
+    
+
+def make_server_manager(port, authkey):
     """ Create a manager for the server, listening on the given port.
         Return a manager object with get_job_q and get_result_q methods.
-        """
+    """
     job_q = multiprocessing.Queue()
     result_q = multiprocessing.Queue()
-    
-    # This is based on the examples in the official docs of multiprocessing.
-    # get_{job|result}_q return synchronized proxies for the actual Queue
-    # objects.
-    class JobQueueManager(SyncManager):
-        pass
-    
-    JobQueueManager.register('get_job_q', callable=lambda: job_q)
-    JobQueueManager.register('get_result_q', callable=lambda: result_q)
-    
-    manager = JobQueueManager(address=(ip, port), authkey=secret)
+
+    manager = JobQueueManager(address=('127.0.0.1', port), authkey=authkey)
+
+    manager.register('get_job_q', callable=Returner(job_q))
+    manager.register('get_result_q', callable=Returner(result_q))
+
     manager.start()
-    
-    print 'Server started at:', manager.address
+    print 'Server started at port %s' % port
     return manager
 
-
-def make_client_manager(ip, port, secret):
+class ServerQueueManager(SyncManager):
+    pass
+    
+def make_client_manager(address, authkey):
     """ Create a manager for a client. This manager connects to a server on the
         given address and exposes the get_job_q and get_result_q methods for
         accessing the shared queues from the server.
         Return a manager object.
         """
-    class ServerQueueManager(SyncManager):
-        pass
-    
     ServerQueueManager.register('get_job_q')
     ServerQueueManager.register('get_result_q')
     
-    manager = ServerQueueManager(address=(ip, port), authkey=secret)
+    manager = ServerQueueManager(address, authkey=authkey)
     manager.connect()
     
     print 'Client connected to:', manager.address
     return manager
+
+def run_client(address, authkey):
+    manager = make_client_manager(address, authkey)
+    job_q = manager.get_job_q()
+    result_q = manager.get_result_q()
+
+    worker(job_q, result_q)
 
 
 def main():
@@ -494,17 +538,16 @@ def main():
     parser = optparse.OptionParser()
     parser.add_option('--mode', help='Mode of the script: server/client/standalone', default='standalone')
     parser.add_option('--ip', help='IP of server', default='127.0.0.1')
-    parser.add_option('--port', default=8080, type=int)
+    parser.add_option('--port', default=65001, type=int)
     parser.add_option('--auth', default='changeme')
 
-    
     options_obj, args = parser.parse_args()
     options = vars(options_obj)
     
     print 'Options:', options
     
     if 'server' == options['mode']:
-        manager = make_server_manager(options['ip'], options['port'], options['auth'])
+        manager = make_server_manager(options['port'], options['auth'])
         shared_job_q = manager.get_job_q()
         shared_result_q = manager.get_result_q()
         shared_job_q.put(Job(1))
@@ -517,11 +560,7 @@ def main():
 
         manager.shutdown()
     elif 'client' == options['mode']:
-        manager = make_client_manager(options['ip'], options['port'], options['auth'])
-        job_q = manager.get_job_q()
-        result_q = manager.get_result_q()
-
-        worker(job_q, result_q)
+        run_client(address=(options['ip'], options['port']), authkey=options['auth'])
     elif 'standalone' == options['mode']:
         #test_fanout()
         test_pool_results()
@@ -607,18 +646,27 @@ def test_pool_time():
     scale = 1.4
     assert durations[0] > (durations[1] * scale)
 
-def xxxtest_pool_results():
-    
-    manager = make_server_manager(ip='', port=65001, secret='hi')
-    job_q = manager.Queue()
-    result_q = manager.Queue()
+def test_pool_results():
+    port = 65001
+    authkey='hi'
+    manager = make_server_manager(port=port, authkey=authkey)
+    job_q = manager.get_job_q()
+    result_q = manager.get_result_q()
     
     qb_pool = QueueBasedPool(job_q, result_q)
+
+    #manager = make_client_manager('localhost', port=65001, authkey='hi')
+    #job_q = manager.get_job_q()
+    #result_q = manager.get_result_q()
+    #worker(job_q, result_q)
     
     pools = [qb_pool, FakePool(), multiprocessing.Pool(), multiprocessing.pool.ThreadPool()]
     durations = []
     results = []
-    
+
+    client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':('localhost', port), 'authkey' : authkey})#, args=(address=('localhost',port), authkey=authkey))
+    client_p.start()
+
     for pool in pools:
         width = 4
         depth = 3
@@ -630,12 +678,14 @@ def xxxtest_pool_results():
         durations.append(sw.duration())
         results.append(result)
     
+    client_p.join();
+    qb_pool.request_stop()
+
     print durations
     print results
-    #suppose to run in parallel so just sleep_time, giving some slack for debugger/etc
-    scale = 1.8
-    #assert durations[0] > durations[1] * scale
 
+    assert all(x == results[0] for x in results)
+    pass
 
 def test_fanout():
     pool = FakePool()
@@ -649,7 +699,5 @@ def test_fanout():
     pass
 
 if __name__ == '__main__':
-    multiprocessing.freeze_support()
+    #multiprocessing.freeze_support()
     sys.exit(main())
-
-
