@@ -4,16 +4,17 @@
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>{357121a9-28c2-47b6-a397-93d87cf3d385}</ProjectGuid>
-    <ProjectHome>.</ProjectHome>
-    <StartupFile>pycopipe.py</StartupFile>
+    <ProjectHome>
+    </ProjectHome>
+    <StartupFile>casepipe.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
-    <Name>pycotest</Name>
+    <Name>casepipe</Name>
     <RootNamespace>pycotest</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>--mode stanalone --auth hi</CommandLineArguments>
+    <CommandLineArguments>-j 0</CommandLineArguments>
     <InterpreterPath />
     <InterpreterArguments />
   </PropertyGroup>

@@ -10,7 +10,21 @@ import Queue
 #import pycallgraph
 import uuid
 import pickle
+import logging
 
+ 
+def _replace_future_result_with_value(fr):
+    if isinstance(fr, FutureResult):
+        return fr.value if fr.ready() else None
+    elif isinstance(fr, list):
+        for idx,i in enumerate(fr):
+            fr[idx] = _replace_future_result_with_value(i)
+        return fr
+    elif isinstance(fr, tuple):
+        temp = _replace_future_result_with_value(list(fr))
+        return tuple(temp)
+    else:
+        return fr
 
 def _process_one_step(pipeline):
     u"Process a step of the pipeline, return sub-pipelines and/or wrapped values"
@@ -27,13 +41,32 @@ def _process_one_step(pipeline):
     if not all(dependencies_status):
         assert "not all dependencies ready yet"
     else:
-        for idx, x in enumerate(args):
-            if isinstance(x, FutureResult):
-                if x.ready():
-                    args[idx] = x.value
-                else:
-                    assert False
-                    return "not all dependencies ready yet"
+        args = _replace_future_result_with_value(args)
+        #for idx, x in enumerate(args):
+        #    if isinstance(x, FutureResult):
+        #        if x.ready():
+        #            args[idx] = x.value
+        #        else:
+        #            assert False
+        #            return "not all dependencies ready yet"
+        #    elif isinstance(x, list):
+        #        for idx,y in enumerate(x):
+        #            if isinstance(y, FutureResult):
+        #                if y.ready():
+        #                    x[idx] = y.value
+        #                else:
+        #                    assert False
+        #                    return "not all dependencies ready yet"
+        #    elif isinstance(x, tuple):
+        #        z = list(x)
+        #        for idx,y in enumerate(z):
+        #            if isinstance(y, FutureResult):
+        #                if y.ready():
+        #                    z[idx] = y.value
+        #                else:
+        #                    assert False
+        #                    return "not all dependencies ready yet"
+        #        args[idx] = tuple(z)
 
         fr = None
         generator = pipeline.run(*args, **kwargs)
@@ -183,6 +216,16 @@ class FakePool(object):
         result._set(func(*args))
         return result
 
+    def close(self):
+        pass
+
+    def join(self):
+        pass
+
+    def terminate(self):
+        pass
+
+
 class Job:
     _id = 0
 
@@ -216,7 +259,7 @@ def read_result_q(result_q, job_id_event_map_lock, job_id_event_map):
             break
 
         with job_id_event_map_lock:
-            async_result = job_id_event_map[job_id]
+            async_result = job_id_event_map.pop(job_id)
             async_result._set(result)
 
 class QueueAsyncResult:
@@ -239,6 +282,7 @@ class QueueAsyncResult:
         return True
     
     def _set(self, result):
+        assert self._event.is_set() == False
         self._result = result
         self._event.set()
 
@@ -260,11 +304,20 @@ class QueueBasedPool(object):
             self._job_q.put(job)
         return async_result
 
-    def request_stop(self):
+    def close(self):
         pill = None, None
         self._result_q.put(pill)
-        self._worker_thread.join()
 
+    def join(self, timeout=None):
+        self._worker_thread.join(timeout)
+
+    def terminate(self):
+        #python cannot actually terminate threads
+        #self._worker_thread.terminate()
+
+        #at least try to close
+        self.close()
+        self.join(timeout=3)
 
 class Pipeline(object):
     def __init__(self, *args, **kwargs):
@@ -459,24 +512,6 @@ class StopWatch(object):
         duration = self.stop_time - self.start_time
         return duration
 
-def worker(job_q, result_q):
-    sleeps = [1, 2, 4] # 4, 4, 4, 4, 4, 4, 4, 4, 10, 10, 10, 10, 20, 30, 60]
-    sleep_index = 0
-    while sleep_index < len(sleeps):
-        try:
-            while True:
-                job = job_q.get_nowait()
-                print "Got job:", job
-                result = job.function(job.args[0][0])
-                comb = job.id, result
-                result_q.put(comb)
-                sleep_index = 0
-        except Queue.Empty:
-            print "Got empty queue -- sleeping for {0} seconds".format(sleeps[sleep_index])
-            time.sleep(sleeps[sleep_index])
-            sleep_index+=1
-         
-
 # This is based on the examples in the official docs of multiprocessing.
 # get_{job|result}_q return synchronized proxies for the actual Queue
 # objects.
@@ -503,7 +538,7 @@ def make_server_manager(port, authkey):
     manager.register('get_result_q', callable=Returner(result_q))
 
     manager.start()
-    print 'Server started at port %s' % port
+    logging.info('Server started at port %s' % port)
     return manager
 
 class ServerQueueManager(SyncManager):
@@ -521,16 +556,49 @@ def make_client_manager(address, authkey):
     manager = ServerQueueManager(address, authkey=authkey)
     manager.connect()
     
-    print 'Client connected to:', manager.address
+    print 'Connecting to:', manager.address
     return manager
 
-def run_client(address, authkey):
+def process_jobs(address, authkey):
     manager = make_client_manager(address, authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
+    logger = multiprocessing.log_to_stderr()
+    logger.setLevel(logging.INFO)
 
-    worker(job_q, result_q)
+    def clamp(minimum, x, maximum):
+        return max(minimum, min(x, maximum))
 
+    def calc_sleep_time(sleep_power):
+        return clamp(0, 2**sleep_power, 120)
+
+    sleep_power = 0
+
+    while True:
+        try:
+            while True:
+                timeout = calc_sleep_time(sleep_power)
+                job = job_q.get(timeout)
+                logger.info("Got job: {job}".format(job=job))
+                result = job.function(job.args[0][0])
+                comb = job.id, result
+                result_q.put(comb)
+                sleep_power = 0
+        except Queue.Empty:
+            logger.info("Got empty queue -- sleeping for {0} seconds".format(sleeps[sleep_index]))
+            sleep_power += 1
+    
+    logger.info('Worker done -- existing')
+
+def run_client(address, authkey):
+    processors = multiprocessing.cpu_count() - 1
+    pool = multiprocessing.Pool(processes = processors)
+
+    for p in xrange(processors):
+        pool.apply_async(process_jobs, args=(address, authkey)) 
+
+    pool.close()
+    pool.join()
 
 def main():
     import optparse
@@ -652,7 +720,12 @@ def test_pool_results():
     manager = make_server_manager(port=port, authkey=authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
-    
+
+    logger = multiprocessing.log_to_stderr()
+    logger.setLevel(logging.INFO)
+    logger.warning('doomed')    
+
+
     qb_pool = QueueBasedPool(job_q, result_q)
 
     #manager = make_client_manager('localhost', port=65001, authkey='hi')
@@ -664,7 +737,8 @@ def test_pool_results():
     durations = []
     results = []
 
-    client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':('localhost', port), 'authkey' : authkey})#, args=(address=('localhost',port), authkey=authkey))
+    client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':('localhost', port), 'authkey' : authkey})
+    #, args=(address=('localhost',port), authkey=authkey))
     client_p.start()
 
     for pool in pools:
@@ -678,8 +752,11 @@ def test_pool_results():
         durations.append(sw.duration())
         results.append(result)
     
-    client_p.join();
-    qb_pool.request_stop()
+    client_p.join()
+
+    qb_pool.close()
+    qb_pool.join()
+
 
     print durations
     print results

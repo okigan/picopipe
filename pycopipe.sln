@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 11.00
 # Visual Studio 2010
-Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "pycopipe", "pycopipe.pyproj", "{357121A9-28C2-47B6-A397-93D87CF3D385}"
+Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "casepipe", "casepipe.pyproj", "{357121A9-28C2-47B6-A397-93D87CF3D385}"
 EndProject
 Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "pycopipe_client", "pycopipe_client.pyproj", "{A7FDD380-67E5-4257-BC0D-C78CD90CF4A6}"
 EndProject
