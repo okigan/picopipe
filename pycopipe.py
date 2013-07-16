@@ -307,6 +307,7 @@ class QueueBasedPool(object):
     def close(self):
         pill = None, None
         self._result_q.put(pill)
+        pass
 
     def join(self, timeout=None):
         self._worker_thread.join(timeout)
@@ -529,13 +530,15 @@ def make_server_manager(port, authkey):
     """ Create a manager for the server, listening on the given port.
         Return a manager object with get_job_q and get_result_q methods.
     """
-    job_q = multiprocessing.Queue()
+    job_q = multiprocessing.JoinableQueue()
     result_q = multiprocessing.Queue()
+    shutdown_e = multiprocessing.Event()
 
     manager = JobQueueManager(address=('127.0.0.1', port), authkey=authkey)
 
     manager.register('get_job_q', callable=Returner(job_q))
     manager.register('get_result_q', callable=Returner(result_q))
+    manager.register('get_shutdown_e', callable=Returner(shutdown_e))
 
     manager.start()
     logging.info('Server started at port %s' % port)
@@ -552,19 +555,22 @@ def make_client_manager(address, authkey):
         """
     ServerQueueManager.register('get_job_q')
     ServerQueueManager.register('get_result_q')
+    ServerQueueManager.register('get_shutdown_e')
     
     manager = ServerQueueManager(address, authkey=authkey)
     manager.connect()
     
-    print 'Connecting to:', manager.address
+    logging.info('Connecting to: ${address}s' % {'address' : manager.address} )
+
     return manager
 
 def process_jobs(address, authkey):
+    logger = multiprocessing.log_to_stderr()
+    logger.setLevel(logging.INFO)
     manager = make_client_manager(address, authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(logging.INFO)
+    shutdown_e = manager.get_shutdown_e()
 
     def clamp(minimum, x, maximum):
         return max(minimum, min(x, maximum))
@@ -574,31 +580,35 @@ def process_jobs(address, authkey):
 
     sleep_power = 0
 
-    while True:
+    while not shutdown_e.is_set():
         try:
-            while True:
-                timeout = calc_sleep_time(sleep_power)
-                job = job_q.get(timeout)
-                logger.info("Got job: {job}".format(job=job))
-                result = job.function(job.args[0][0])
-                comb = job.id, result
-                result_q.put(comb)
-                sleep_power = 0
+            timeout = calc_sleep_time(sleep_power)
+            job = job_q.get_nowait()
+            logger.info("Got job: {job}".format(job=job))
+            result = job.function(job.args[0][0])
+            comb = job.id, result
+            result_q.put(comb)
+            job_q.task_done()
+            sleep_power = 0
         except Queue.Empty:
-            logger.info("Got empty queue -- sleeping for {0} seconds".format(sleeps[sleep_index]))
+            #logger.info("Got empty queue -- sleeping for {0} seconds".format(sleeps[sleep_index]))
             sleep_power += 1
     
     logger.info('Worker done -- existing')
 
 def run_client(address, authkey):
     processors = multiprocessing.cpu_count() - 1
-    pool = multiprocessing.Pool(processes = processors)
 
-    for p in xrange(processors):
-        pool.apply_async(process_jobs, args=(address, authkey)) 
+    if True:
+        process_jobs(address, authkey)
+    else:
+        pool = multiprocessing.Pool(processes = processors)
 
-    pool.close()
-    pool.join()
+        for p in xrange(processors):
+            pool.apply_async(process_jobs, args=(address, authkey)) 
+
+        pool.close()
+        pool.join()
 
 def main():
     import optparse
@@ -629,9 +639,13 @@ def main():
         manager.shutdown()
     elif 'client' == options['mode']:
         run_client(address=(options['ip'], options['port']), authkey=options['auth'])
-    elif 'standalone' == options['mode']:
+    elif 'test_pool_server' == options['mode']:
         #test_fanout()
-        test_pool_results()
+        test_pool_results(False)
+    elif 'test_pool_client' == options['mode']:
+        port = options['port']
+        authkey = options['auth']
+        run_client(address =('localhost', port), authkey=authkey)
     else:
         print 'Uknown mode specified'
         return -1
@@ -714,32 +728,28 @@ def test_pool_time():
     scale = 1.4
     assert durations[0] > (durations[1] * scale)
 
-def test_pool_results():
+def test_pool_results(start_client=True):
+    logger = multiprocessing.log_to_stderr()
+    logger.setLevel(logging.DEBUG)
+    logger.info('Staring')    
+
     port = 65001
     authkey='hi'
     manager = make_server_manager(port=port, authkey=authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
 
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(logging.INFO)
-    logger.warning('doomed')    
-
-
     qb_pool = QueueBasedPool(job_q, result_q)
-
-    #manager = make_client_manager('localhost', port=65001, authkey='hi')
-    #job_q = manager.get_job_q()
-    #result_q = manager.get_result_q()
-    #worker(job_q, result_q)
     
     pools = [qb_pool, FakePool(), multiprocessing.Pool(), multiprocessing.pool.ThreadPool()]
     durations = []
     results = []
 
-    client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':('localhost', port), 'authkey' : authkey})
-    #, args=(address=('localhost',port), authkey=authkey))
-    client_p.start()
+    client_p = None
+    
+    if True: 
+        client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':('localhost', port), 'authkey' : authkey})
+        client_p.start()
 
     for pool in pools:
         width = 4
@@ -751,12 +761,19 @@ def test_pool_results():
         
         durations.append(sw.duration())
         results.append(result)
+
+        pool.close();
+        pool.join()
     
-    client_p.join()
+    logging.info("Shutting down manager")
 
-    qb_pool.close()
-    qb_pool.join()
-
+    shutdown_e = manager.get_shutdown_e()
+    shutdown_e.set()
+    logging.info("Sleeping to allow clients to shutdown down")
+    time.sleep(4)
+    job_q.close()
+    job_q.join()
+    manager.shutdown()
 
     print durations
     print results

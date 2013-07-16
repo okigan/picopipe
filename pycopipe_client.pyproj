@@ -13,7 +13,7 @@
     <Name>pycotest</Name>
     <RootNamespace>pycotest</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>--mode client --auth hi</CommandLineArguments>
+    <CommandLineArguments>--mode test_pool_client --auth hi</CommandLineArguments>
     <InterpreterPath />
     <InterpreterArguments />
   </PropertyGroup>
