@@ -190,6 +190,7 @@ def square_me(x):
 class AsyncResult(object):
     def __init__(self):
         self._result = None
+        self._successful = None
 
     def get(self, timeout=0):
         return self._result
@@ -201,10 +202,12 @@ class AsyncResult(object):
         return True
 
     def successful(self):
-        return True
+        assert self.ready()
+        return self._successful
     
-    def _set(self, result):
+    def _set(self, result, successful):
         self._result = result
+        self._successful = successful
             
     
 class FakePool(object):
@@ -213,7 +216,7 @@ class FakePool(object):
     
     def apply_async(self, func, args):
         result = AsyncResult()
-        result._set(func(*args))
+        result._set(func(*args), True)
         return result
 
     def close(self):
@@ -226,7 +229,7 @@ class FakePool(object):
         pass
 
 
-class Job:
+class Job(object):
     _id = 0
 
     @staticmethod
@@ -235,8 +238,12 @@ class Job:
         return Job._id
         #return uuid.uuid4()
 
-    def __init__(self, function, *args, **kwargs):
+    def __init__(self, function, args=(), kwargs={}, timeout=0):
         self._uuid = Job._next_job_id()
+        self._retry_count = 0
+        self._start_time = 0
+        self._timeout = 2
+        self.successful = None
         self.function = function
         self.args = args
         self.kwargs = kwargs
@@ -245,27 +252,61 @@ class Job:
     def id(self):
         return self._uuid
     
-    def process():
-        self.function(*self.args, **self.kwargs)
+    def process(self):
+        self._start_time = time.time()
+        result = self.function(*self.args, **self.kwargs)
+        self.successful = True
+
+        return result
 
     def __str__(self):
         return str(self._uuid) + ',' + str(self.function)
 
 
-def read_result_q(result_q, job_id_event_map_lock, job_id_event_map):
+def _read_result_q(pool, result_q, job_id_event_map_lock, job_id_event_map, job_id_job_map):
     while True:
-        job_id, result = result_q.get()
-        if job_id is None:
-            break
+        try: 
+            job_id, result = result_q.get()
+            if job_id is None:
+                #fail all jobs that stil waiting for results
+                with job_id_event_map_lock:
+                    failed_job_ids = job_id_job_map.keys()
+                    for failed_job_id in failed_job_ids:
+                        pool.fail_job(failed_job_id)
+                #break whole looop
+                break
+            else:
+                #process result for job_id
+                with job_id_event_map_lock:
+                    async_result = job_id_event_map.pop(job_id, None)
+                    job = job_id_job_map.pop(job_id, None)
+                    if async_result is not None: 
+                        async_result._set(result, True)
+                    else:
+                        msg = 'Jobid %{job_id}s does not exists or result was already submitted'
+                        logging.warning(msg  % { 'job_id' : job.id})
+        except Queue.Empty:
+            with job_id_event_map_lock:
 
-        with job_id_event_map_lock:
-            async_result = job_id_event_map.pop(job_id)
-            async_result._set(result)
+                #fail or resubmit timedout jobs
+                failed_job_ids = []
+
+                for k,v in job_id_job_map.iteritems():
+                    if v._timeout > 0:
+                        if (time.time() - v._start_time) > v._timeout:
+                            if v._retry_count < 3:
+                                pool.resubmit_job(v.id)
+                            else:
+                                failed_job_ids.append(v.id)
+
+                for failed_job_id in failed_job_ids:
+                    pool.fail_job(failed_job_id)
 
 class QueueAsyncResult:
     def __init__(self):
         self._result = None
         self._event = threading.Event()
+        self._successful = None
     
     def get(self, timeout=0):
         self.wait(timeout)
@@ -279,42 +320,79 @@ class QueueAsyncResult:
         return self._event.is_set()
     
     def successful(self):
-        return True
+        assert self.ready()
+        return self._successful
     
-    def _set(self, result):
+    def _set(self, result, successful):
         assert self._event.is_set() == False
         self._result = result
+        self._successful = successful
         self._event.set()
 
 class QueueBasedPool(object):
     def __init__(self, job_q, result_q):
         self._job_q = job_q
         self._result_q = result_q
-        self._job_id_event_map = {}
-        self._job_id_event_map_lock = threading.Lock()
-        args = self._result_q, self._job_id_event_map_lock, self._job_id_event_map
-        self._worker_thread = threading.Thread(target=read_result_q, args=args)
-        self._worker_thread.start()
 
-    def apply_async(self, func, args):
-        job = Job(func, args)
+        self._command_q = Queue.Queue() # for resubmit thread
+
+        self._job_id_event_map_lock = threading.RLock()
+        self._job_id_event_map = {}
+        self._job_id_job_map = {}
+
+        args = self, self._result_q, self._job_id_event_map_lock, self._job_id_event_map, self._job_id_job_map
+        self._read_result_q_worker_thread = None
+        self._read_result_q_worker_thread = threading.Thread(target=_read_result_q, args=args)
+        self._read_result_q_worker_thread.start()
+
+    def apply_async(self, func, args=(), kwargs={}, timeout=0):
+        job = Job(func, args, kwargs, timeout=timeout)
         async_result = QueueAsyncResult()
         with self._job_id_event_map_lock:
             self._job_id_event_map[job.id] = async_result
+            self._job_id_job_map[job.id] = job
             self._job_q.put(job)
         return async_result
+
+    def resubmit_job(self, job_id):
+        with self._job_id_event_map_lock:
+            job = self._job_id_job_map[job_id]
+            async_result = self._job_id_event_map[job.id]
+            job._retry_count += 1
+            self._job_q.put(job)
+            return async_result
+
+    def fail_job(self, job_id):
+        with self._job_id_event_map_lock:
+            async_result = self._job_id_event_map.pop(job_id, None)
+            if async_result is not None: 
+                async_result._set(None, False)
+
+            job = self._job_id_job_map.get(job_id, None)
+            if job is not None:
+                if job.successful is None:
+                    self._job_q.task_done()
+                    job.successful = False
+            else: 
+                logging.warning('Could not delete failed job')
+
+
 
     def close(self):
         pill = None, None
         self._result_q.put(pill)
+
+        pill = None
+        self._command_q.put(pill)
         pass
 
     def join(self, timeout=None):
-        self._worker_thread.join(timeout)
+        if self._read_result_q_worker_thread is not None:
+            self._read_result_q_worker_thread.join(timeout)
 
     def terminate(self):
         #python cannot actually terminate threads
-        #self._worker_thread.terminate()
+        #self._read_result_q_worker_thread.terminate()
 
         #at least try to close
         self.close()
@@ -367,7 +445,7 @@ class Pipeline(object):
                     if node.state == FutureResultState.POPULATING:
                         async_result = node_to_async_result_map[node]
                         #async_result.wait(1)
-                        if async_result.ready():
+                        if async_result.ready() and async_result.successful():
                             results = async_result.get()
                             del node_to_async_result_map[node]
                             
@@ -585,7 +663,7 @@ def process_jobs(address, authkey):
             timeout = calc_sleep_time(sleep_power)
             job = job_q.get_nowait()
             logger.info("Got job: {job}".format(job=job))
-            result = job.function(job.args[0][0])
+            result = job.process()
             comb = job.id, result
             result_q.put(comb)
             job_q.task_done()
@@ -730,7 +808,7 @@ def test_pool_time():
 
 def test_pool_results(start_client=True):
     logger = multiprocessing.log_to_stderr()
-    logger.setLevel(logging.DEBUG)
+    #logger.setLevel(logging.DEBUG)
     logger.info('Staring')    
 
     port = 65001
@@ -741,7 +819,7 @@ def test_pool_results(start_client=True):
 
     qb_pool = QueueBasedPool(job_q, result_q)
     
-    pools = [qb_pool, FakePool(), multiprocessing.Pool(), multiprocessing.pool.ThreadPool()]
+    pools = [qb_pool, FakePool()]#, multiprocessing.Pool(),multiprocessing.pool.ThreadPool(), multiprocessing.Pool()]
     durations = []
     results = []
 
@@ -780,6 +858,38 @@ def test_pool_results(start_client=True):
 
     assert all(x == results[0] for x in results)
     pass
+
+def test_job_resubmit(start_client=True):
+    logger = multiprocessing.log_to_stderr()
+    logger.setLevel(logging.DEBUG)
+    logger.info('Staring')    
+
+    port = 65001
+    authkey='hi'
+    manager = make_server_manager(port=port, authkey=authkey)
+    job_q = manager.get_job_q()
+    result_q = manager.get_result_q()
+    shutdown_e = manager.get_shutdown_e()
+
+    #job_q = Queue.Queue()
+    #result_q = Queue.Queue()
+
+    qb_pool = QueueBasedPool(job_q, result_q)
+    qb_pool.apply_async(square_me, (2,), {}, 1)
+
+    qb_pool.close()
+    qb_pool.join()
+
+    time.sleep(3)
+    
+    with qb_pool._job_id_event_map_lock:
+        assert 1 == len(qb_pool._job_id_job_map.keys())
+        assert False == qb_pool._job_id_job_map.values()[0].successful
+        #assert 0 == qb_pool._job_q.unfinished_tasks
+
+    shutdown_e.set()
+    job_q.join()
+    manager.shutdown()
 
 def test_fanout():
     pool = FakePool()
