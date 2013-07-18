@@ -11,6 +11,8 @@ import Queue
 import uuid
 import pickle
 import logging
+import re
+import functools 
 
  
 def _replace_future_result_with_value(fr):
@@ -238,11 +240,12 @@ class Job(object):
         return Job._id
         #return uuid.uuid4()
 
-    def __init__(self, function, args=(), kwargs={}, timeout=0):
+    def __init__(self, function, args=(), kwargs={}, timeout=0, callback=None):
         self._uuid = Job._next_job_id()
         self._retry_count = 0
         self._start_time = 0
         self._timeout = 2
+        self._callback = callback
         self.successful = None
         self.function = function
         self.args = args
@@ -303,10 +306,11 @@ def _read_result_q(pool, result_q, job_id_event_map_lock, job_id_event_map, job_
                     pool.fail_job(failed_job_id)
 
 class QueueAsyncResult:
-    def __init__(self):
+    def __init__(self, set_callback=None):
         self._result = None
         self._event = threading.Event()
         self._successful = None
+        self._on_set_callback = set_callback
     
     def get(self, timeout=0):
         self.wait(timeout)
@@ -328,6 +332,9 @@ class QueueAsyncResult:
         self._result = result
         self._successful = successful
         self._event.set()
+        
+        if self._on_set_callback is not None:
+            self._on_set_callback()
 
 class QueueBasedPool(object):
     def __init__(self, job_q, result_q):
@@ -345,9 +352,9 @@ class QueueBasedPool(object):
         self._read_result_q_worker_thread = threading.Thread(target=_read_result_q, args=args)
         self._read_result_q_worker_thread.start()
 
-    def apply_async(self, func, args=(), kwargs={}, timeout=0):
+    def apply_async(self, func, args=(), kwargs={}, timeout=0, callback=None):
         job = Job(func, args, kwargs, timeout=timeout)
-        async_result = QueueAsyncResult()
+        async_result = QueueAsyncResult(set_callback=callback)
         with self._job_id_event_map_lock:
             self._job_id_event_map[job.id] = async_result
             self._job_id_job_map[job.id] = job
@@ -398,6 +405,9 @@ class QueueBasedPool(object):
         self.close()
         self.join(timeout=3)
 
+def _set_state_changed_event(event):
+    event.set()
+
 class Pipeline(object):
     def __init__(self, *args, **kwargs):
         self.args = args
@@ -417,9 +427,11 @@ class Pipeline(object):
         processing_tree = FutureResult(self, note='root')
         node_to_async_result_map = {}
         #TODO: add toposort
+
+        state_changed_event = threading.Event()
         
         state_changed = True
-        while state_changed:
+        while not processing_tree.ready():
             state_changed = False
 
             for node in processing_tree.iternodes():
@@ -438,7 +450,8 @@ class Pipeline(object):
                         dependencies_status = map(lambda x:x.ready(), frs)
     
                         if all(dependencies_status):
-                            node_to_async_result_map[node] = pool.apply_async(_process_one_step, (node.pipeline,))
+                            callback = functools.partial(_set_state_changed_event, state_changed_event)
+                            node_to_async_result_map[node] = pool.apply_async(_process_one_step, (node.pipeline,)) #, callback=callback)
                             node.state = FutureResultState.POPULATING
                             state_changed = True
                         
@@ -464,7 +477,7 @@ class Pipeline(object):
                         #if r.pipeline == None:
                             node.state = FutureResultState.POPULATED
                         #keep the loop running while a job is thinking (could add timeout here)
-                        state_changed = True
+                        #state_changed = True
                     
                     if node.state == FutureResultState.POPULATED:
                         if not node.ready():
@@ -475,6 +488,12 @@ class Pipeline(object):
                                 node.pipeline.on_finished()
                 else:
                     print 'Unexpected pipeline state'
+
+            if not state_changed:
+                state_changed_event.wait(5)
+                state_changed = True
+                state_changed_event.clear()
+
 
         return processing_tree.value
 
@@ -661,9 +680,11 @@ def process_jobs(address, authkey):
     while not shutdown_e.is_set():
         try:
             timeout = calc_sleep_time(sleep_power)
-            job = job_q.get_nowait()
+            logger.info("Waiting up to {timeout} seconds for a new job".format(timeout=timeout))
+            job = job_q.get(True, timeout)
             logger.info("Got job: {job}".format(job=job))
             result = job.process()
+            logger.info("Done processing job: {job}".format(job=job))
             comb = job.id, result
             result_q.put(comb)
             job_q.task_done()
@@ -692,35 +713,66 @@ def main():
     import optparse
     
     parser = optparse.OptionParser()
-    parser.add_option('--mode', help='Mode of the script: server/client/standalone', default='standalone')
+    parser.add_option('-v', '--verbose', dest='verbose', action='count')
+    parser.add_option('--mode', help='Mode of the script: standalone/server/client/test', default='standalone')
     parser.add_option('--ip', help='IP of server', default='127.0.0.1')
     parser.add_option('--port', default=65001, type=int)
     parser.add_option('--auth', default='changeme')
+    parser.add_option('--test_name', default='test_basic')
 
     options_obj, args = parser.parse_args()
     options = vars(options_obj)
     
+    log_level = logging.WARNING # default
+    if options_obj.verbose == 1:
+        log_level = logging.INFO
+    elif options_obj.verbose >= 2:
+        log_level = logging.DEBUG
+
+    # Set up basic configuration, out to stderr with a reasonable default format.
+    logging.basicConfig(level=log_level)
     print 'Options:', options
     
-    if 'server' == options['mode']:
+    option_mode = options['mode']
+
+    if 'standalone' == option_mode:
+        test_basic()
+    elif 'server' == option_mode:
         manager = make_server_manager(options['port'], options['auth'])
         shared_job_q = manager.get_job_q()
         shared_result_q = manager.get_result_q()
-        shared_job_q.put(Job(1))
-        shared_job_q.put(Job(2))
+        shared_shutdown_e = manager.get_shutdown_e()
+        shared_job_q.put(Job(square_me, (1,)))
+        shared_job_q.put(Job(square_me, (2,)))
         
         outdict = shared_result_q.get()
         print outdict
         outdict = shared_result_q.get()
         print outdict
 
+        shared_shutdown_e.set()
+        shared_job_q.join()
         manager.shutdown()
-    elif 'client' == options['mode']:
+    elif 'client' == option_mode:
         run_client(address=(options['ip'], options['port']), authkey=options['auth'])
-    elif 'test_pool_server' == options['mode']:
+    elif 'test' == option_mode:
+        test_function_name = options['test_name']
+
+        module = sys.modules[__name__]
+        regex = re.compile(test_function_name)
+
+        for attrib in dir(module):
+            if re.match(regex, attrib):
+                function = getattr(module, attrib)
+                if callable(function):
+                    print 'Calling', attrib
+                    function()
+
+        return 0
+    elif 'test_pool_server' == option_mode:
         #test_fanout()
         test_pool_results(False)
-    elif 'test_pool_client' == options['mode']:
+    elif 'test_pool_client' == option_mode:
         port = options['port']
         authkey = options['auth']
         run_client(address =('localhost', port), authkey=authkey)
@@ -903,5 +955,5 @@ def test_fanout():
     pass
 
 if __name__ == '__main__':
-    #multiprocessing.freeze_support()
+    multiprocessing.freeze_support()
     sys.exit(main())
