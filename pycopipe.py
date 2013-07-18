@@ -398,6 +398,8 @@ class QueueBasedPool(object):
             self._read_result_q_worker_thread.join(timeout)
 
     def terminate(self):
+        print "Terminating"
+
         #python cannot actually terminate threads
         #self._read_result_q_worker_thread.terminate()
 
@@ -657,7 +659,7 @@ def make_client_manager(address, authkey):
     manager = ServerQueueManager(address, authkey=authkey)
     manager.connect()
     
-    logging.info('Connecting to: ${address}s' % {'address' : manager.address} )
+    logging.info('Connecting to: %(address)s' % {'address' : manager.address} )
 
     return manager
 
@@ -721,7 +723,6 @@ def main():
     parser.add_option('--test_name', default='test_basic')
 
     options_obj, args = parser.parse_args()
-    options = vars(options_obj)
     
     log_level = logging.WARNING # default
     if options_obj.verbose == 1:
@@ -731,6 +732,8 @@ def main():
 
     # Set up basic configuration, out to stderr with a reasonable default format.
     logging.basicConfig(level=log_level)
+ 
+    options = vars(options_obj)
     print 'Options:', options
     
     option_mode = options['mode']
