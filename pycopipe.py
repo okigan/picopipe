@@ -271,6 +271,7 @@ def _read_result_q(pool, result_q, job_id_event_map_lock, job_id_event_map, job_
         try: 
             job_id, result = result_q.get()
             if job_id is None:
+                logging.info('Sentinel recieved -- exiting _read_result_q')
                 #fail all jobs that stil waiting for results
                 with job_id_event_map_lock:
                     failed_job_ids = job_id_job_map.keys()
@@ -280,6 +281,8 @@ def _read_result_q(pool, result_q, job_id_event_map_lock, job_id_event_map, job_
                 break
             else:
                 #process result for job_id
+                logging.info('Got result for %s job' % job_id)
+
                 with job_id_event_map_lock:
                     async_result = job_id_event_map.pop(job_id, None)
                     job = job_id_job_map.pop(job_id, None)
@@ -495,6 +498,10 @@ class Pipeline(object):
                 state_changed_event.wait(5)
                 state_changed = True
                 state_changed_event.clear()
+
+            items = sum(1 for x in processing_tree.iternodes())
+            todo =  sum(1 for x in processing_tree.iternodes() if not x.ready())
+            logging.info('Total items in processing tree %s, still to process %s' % (items, todo))
 
 
         return processing_tree.value
