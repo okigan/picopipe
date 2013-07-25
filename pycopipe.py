@@ -1,3 +1,5 @@
+#!/usr/bin/env python 
+
 import sys
 import time
 import itertools
@@ -190,9 +192,10 @@ def square_me(x):
     return x*x    
 
 class AsyncResult(object):
-    def __init__(self):
+    def __init__(self, callback=None):
         self._result = None
         self._successful = None
+        self._on_set_callback = callback
 
     def get(self, timeout=0):
         return self._result
@@ -210,13 +213,16 @@ class AsyncResult(object):
     def _set(self, result, successful):
         self._result = result
         self._successful = successful
+        
+        if self._on_set_callback is not None:
+            self._on_set_callback(result)
             
     
 class FakePool(object):
     def __init__(self):
         pass
     
-    def apply_async(self, func, args):
+    def apply_async(self, func, args=(), kwargs={}, callback=None):
         result = AsyncResult()
         result._set(func(*args), True)
         return result
@@ -337,7 +343,7 @@ class QueueAsyncResult:
         self._event.set()
         
         if self._on_set_callback is not None:
-            self._on_set_callback()
+            self._on_set_callback(result)
 
 class QueueBasedPool(object):
     def __init__(self, job_q, result_q):
@@ -410,13 +416,15 @@ class QueueBasedPool(object):
         self.close()
         self.join(timeout=3)
 
-def _set_state_changed_event(event):
+def _set_state_changed_event(event, value):
     event.set()
 
 class Pipeline(object):
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+        self._process_iteration_callback = None
+
 
     def run(self, *args, **kwargs):
         """
@@ -427,6 +435,9 @@ class Pipeline(object):
 
     def on_finished(self):
         pass
+
+    def set_process_iteration_callback(self, callback):
+        self._process_iteration_callback = callback
 
     def process(self, pool=FakePool()):
         processing_tree = FutureResult(self, note='root')
@@ -456,7 +467,7 @@ class Pipeline(object):
     
                         if all(dependencies_status):
                             callback = functools.partial(_set_state_changed_event, state_changed_event)
-                            node_to_async_result_map[node] = pool.apply_async(_process_one_step, (node.pipeline,)) #, callback=callback)
+                            node_to_async_result_map[node] = pool.apply_async(_process_one_step, (node.pipeline,), callback=callback)
                             node.state = FutureResultState.POPULATING
                             state_changed = True
                         
@@ -481,7 +492,7 @@ class Pipeline(object):
 
                         #if r.pipeline == None:
                             node.state = FutureResultState.POPULATED
-                        #keep the loop running while a job is thinking (could add timeout here)
+                        #keep the loop running while a job is "thinking" (could add timeout here)
                         #state_changed = True
                     
                     if node.state == FutureResultState.POPULATED:
@@ -495,14 +506,22 @@ class Pipeline(object):
                     print 'Unexpected pipeline state'
 
             if not state_changed:
-                state_changed_event.wait(5)
+                logging.info('Started waiting...')
+                wait_result = state_changed_event.wait(5)
+                #logging.info('Finished waiting with result {0}' % str(wait_result))
+                print wait_result
                 state_changed = True
                 state_changed_event.clear()
 
+            if self._process_iteration_callback is not None:
+                self._process_iteration_callback()
+            
+            # log processing tree info            
             items = sum(1 for x in processing_tree.iternodes())
             todo =  sum(1 for x in processing_tree.iternodes() if not x.ready())
-            logging.info('Total items in processing tree %s, still to process %s' % (items, todo))
-
+            new =  sum(1 for x in processing_tree.iternodes() if not x.state == FutureResultState.NEW)
+            populated =  sum(1 for x in processing_tree.iternodes() if not x.state == FutureResultState.POPULATED)
+            logging.info('Processing tree info:  %s, %s, %s, %s (total, todo, new, populated)' % (items, todo, new, populated))
 
         return processing_tree.value
 
@@ -574,9 +593,9 @@ class ComplexReductionPipeline(Pipeline):
 
 class SleepPipeline(Pipeline):
     def run(self, sleep_time):
-        print time.time(), self, "started sleeping for", sleep_time, "seconds"
+        logging.info("{0} started sleeping for {1} seconds".format(self, sleep_time))
         time.sleep(sleep_time)
-        print time.time(), self, "done sleeping"
+        logging.info("{0} done sleeping".format(self))
 
         yield None
         pass
@@ -671,8 +690,9 @@ def make_client_manager(address, authkey):
     return manager
 
 def process_jobs(address, authkey):
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(logging.INFO)
+    #logger = multiprocessing.log_to_stderr()
+    #logger.setLevel(logging.INFO)
+    #logger.propagate = False
     manager = make_client_manager(address, authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
@@ -689,11 +709,11 @@ def process_jobs(address, authkey):
     while not shutdown_e.is_set():
         try:
             timeout = calc_sleep_time(sleep_power)
-            logger.info("Waiting up to {timeout} seconds for a new job".format(timeout=timeout))
+            logging.info("Waiting up to {timeout} seconds for a new job".format(timeout=timeout))
             job = job_q.get(True, timeout)
-            logger.info("Got job: {job}".format(job=job))
+            logging.info("Got job: {job}".format(job=job))
             result = job.process()
-            logger.info("Done processing job: {job}".format(job=job))
+            logging.info("Done processing job: {job}".format(job=job))
             comb = job.id, result
             result_q.put(comb)
             job_q.task_done()
@@ -702,7 +722,7 @@ def process_jobs(address, authkey):
             #logger.info("Got empty queue -- sleeping for {0} seconds".format(sleeps[sleep_index]))
             sleep_power += 1
     
-    logger.info('Worker done -- existing')
+    logging.info('Worker done -- existing')
 
 def run_client(address, authkey):
     processors = multiprocessing.cpu_count() - 1
@@ -723,11 +743,13 @@ def main():
     
     parser = optparse.OptionParser()
     parser.add_option('-v', '--verbose', dest='verbose', action='count')
+    parser.add_option('--logging_format'         , default='%(asctime)s.%(msecs)03d;%(levelname)s;%(message)s')
+    parser.add_option('--logging_datefmt'        , default='%Y-%m-%d %H:%M:%S')
     parser.add_option('--mode', help='Mode of the script: standalone/server/client/test', default='standalone')
     parser.add_option('--ip', help='IP of server', default='127.0.0.1')
     parser.add_option('--port', default=65001, type=int)
     parser.add_option('--auth', default='changeme')
-    parser.add_option('--test_name', default='test_basic')
+    parser.add_option('--test_name_re', default='test_basic')
 
     options_obj, args = parser.parse_args()
     
@@ -738,7 +760,8 @@ def main():
         log_level = logging.DEBUG
 
     # Set up basic configuration, out to stderr with a reasonable default format.
-    logging.basicConfig(level=log_level)
+    logging.basicConfig(level=log_level, format=options_obj.logging_format, datefmt=options_obj.logging_datefmt)
+
  
     options = vars(options_obj)
     print 'Options:', options
@@ -766,7 +789,7 @@ def main():
     elif 'client' == option_mode:
         run_client(address=(options['ip'], options['port']), authkey=options['auth'])
     elif 'test' == option_mode:
-        test_function_name = options['test_name']
+        test_function_name = options['test_name_re']
 
         module = sys.modules[__name__]
         regex = re.compile(test_function_name)
@@ -777,7 +800,7 @@ def main():
                 if callable(function):
                     print 'Calling', attrib
                     function()
-
+                    print 'Returned from', attrib
         return 0
     elif 'test_pool_server' == option_mode:
         #test_fanout()
@@ -849,17 +872,21 @@ def test_sleep_pipeline():
     assert (sw.duration() - 0.1) < width*sleep_time
 
 def test_pool_time():
-    pools = [FakePool(), multiprocessing.Pool()]
+    pools = [FakePool(), multiprocessing.Pool(processes=2)]
     durations = []
+
+    def iteration_callback():
+        logging.info('In callback')
     
     for pool in pools:
+        logging.info('Running with pool %s', pool.__class__)
         width = 2
         depth = 1
         sleep_time = 4
         sw = StopWatch(True)
         assert None == ComplexPipeline(width, depth, SleepPipeline(sleep_time)).process(pool)
         sw.stop()
-        
+    
         durations.append(sw.duration())
     
     print durations
@@ -867,6 +894,7 @@ def test_pool_time():
     #suppose to run in parallel so just sleep_time, giving some slack for debugger/etc
     scale = 1.4
     assert durations[0] > (durations[1] * scale)
+
 
 def test_pool_results(start_client=True):
     logger = multiprocessing.log_to_stderr()
@@ -963,6 +991,7 @@ def test_fanout():
     #result = ComplexPipeline(width, depth, SleepPipeline(1)).process(pool)
     print result
     pass
+
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()

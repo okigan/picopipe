@@ -14,7 +14,7 @@
     <Name>pycopipe_server</Name>
     <RootNamespace>pycotest</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>--mode test_pool_server --auth hi</CommandLineArguments>
+    <CommandLineArguments>--mode test --test_name test_pool_time</CommandLineArguments>
     <InterpreterPath />
     <InterpreterArguments />
   </PropertyGroup>

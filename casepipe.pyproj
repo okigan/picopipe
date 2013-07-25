@@ -14,7 +14,7 @@
     <Name>casepipe</Name>
     <RootNamespace>pycotest</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>-j 0</CommandLineArguments>
+    <CommandLineArguments>-v --batch_mode cloud_cases_scan -s s3://s3_defacto/ --access_key AKIAIMQ7UOLLKVBPFSCQ --secret_key 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</CommandLineArguments>
     <InterpreterPath />
     <InterpreterArguments />
   </PropertyGroup>
