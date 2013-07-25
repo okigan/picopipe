@@ -417,6 +417,7 @@ class QueueBasedPool(object):
         self.join(timeout=3)
 
 def _set_state_changed_event(event, value):
+    logging.info('Setting event in _set_state_changed_event')
     event.set()
 
 class Pipeline(object):
@@ -449,6 +450,7 @@ class Pipeline(object):
         state_changed = True
         while not processing_tree.ready():
             state_changed = False
+            state_changed_event.clear()
 
             for node in processing_tree.iternodes():
                 if isinstance(node, FutureResult):
@@ -492,6 +494,7 @@ class Pipeline(object):
 
                         #if r.pipeline == None:
                             node.state = FutureResultState.POPULATED
+                            state_changed = True
                         #keep the loop running while a job is "thinking" (could add timeout here)
                         #state_changed = True
                     
@@ -508,10 +511,9 @@ class Pipeline(object):
             if not state_changed:
                 logging.info('Started waiting...')
                 wait_result = state_changed_event.wait(5)
-                #logging.info('Finished waiting with result {0}' % str(wait_result))
-                print wait_result
-                state_changed = True
-                state_changed_event.clear()
+                xstr = 'None' if wait_result is None else str(wait_result)
+                logging.info('Finished waiting with result %s.', xstr)
+                #state_changed = True
 
             if self._process_iteration_callback is not None:
                 self._process_iteration_callback()
