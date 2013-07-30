@@ -287,7 +287,7 @@ def _read_result_q(pool, result_q, job_id_event_map_lock, job_id_event_map, job_
                 break
             else:
                 #process result for job_id
-                logging.info('Got result for %s job' % job_id)
+                logging.info('Got result for job_id %s' % job_id)
 
                 with job_id_event_map_lock:
                     async_result = job_id_event_map.pop(job_id, None)
@@ -425,7 +425,7 @@ class Pipeline(object):
         self.args = args
         self.kwargs = kwargs
         self._process_iteration_callback = None
-
+        self._processing_tree = None
 
     def run(self, *args, **kwargs):
         """
@@ -442,6 +442,7 @@ class Pipeline(object):
 
     def process(self, pool=FakePool()):
         processing_tree = FutureResult(self, note='root')
+        self._processing_tree = processing_tree
         node_to_async_result_map = {}
         #TODO: add toposort
 
@@ -455,14 +456,6 @@ class Pipeline(object):
             for node in processing_tree.iternodes():
                 if isinstance(node, FutureResult):
                     if node.state == FutureResultState.NEW:
-                        #for debugging 
-                        #if isinstance(node.pipeline, Sum):
-                            #node.results = _process_one_step(node.pipeline)
-                            #print node.pipeline.args[0].pipeline
-                            #print node.pipeline.args
-                            #print dir(node.pipeline.args[0])
-                            #break
-                        
                         args, kwargs = list(node.pipeline.args), dict(node.pipeline.kwargs)
                         frs = filter(lambda x:isinstance(x, FutureResult), args)
                         dependencies_status = map(lambda x:x.ready(), frs)
@@ -509,10 +502,11 @@ class Pipeline(object):
                     print 'Unexpected pipeline state'
 
             if not state_changed:
-                logging.info('Started waiting...')
-                wait_result = state_changed_event.wait(5)
+                timeout_time = 5
+                logging.info('Waiting for pipeline state change, with timeout {0} s.'.format(timeout_time))
+                wait_result = state_changed_event.wait(timeout_time)
                 xstr = 'None' if wait_result is None else str(wait_result)
-                logging.info('Finished waiting with result %s.', xstr)
+                logging.info('Done waiting with result %s.', xstr)
                 #state_changed = True
 
             if self._process_iteration_callback is not None:
@@ -521,8 +515,8 @@ class Pipeline(object):
             # log processing tree info            
             items = sum(1 for x in processing_tree.iternodes())
             todo =  sum(1 for x in processing_tree.iternodes() if not x.ready())
-            new =  sum(1 for x in processing_tree.iternodes() if not x.state == FutureResultState.NEW)
-            populated =  sum(1 for x in processing_tree.iternodes() if not x.state == FutureResultState.POPULATED)
+            new =  sum(1 for x in processing_tree.iternodes() if x.state == FutureResultState.NEW)
+            populated =  sum(1 for x in processing_tree.iternodes() if x.state == FutureResultState.POPULATED)
             logging.info('Processing tree info:  %s, %s, %s, %s (total, todo, new, populated)' % (items, todo, new, populated))
 
         return processing_tree.value
@@ -653,7 +647,7 @@ class Returner(object):
         return self._value
     
 
-def make_server_manager(port, authkey):
+def make_server_manager(address, authkey):
     """ Create a manager for the server, listening on the given port.
         Return a manager object with get_job_q and get_result_q methods.
     """
@@ -661,14 +655,14 @@ def make_server_manager(port, authkey):
     result_q = multiprocessing.Queue()
     shutdown_e = multiprocessing.Event()
 
-    manager = JobQueueManager(address=('127.0.0.1', port), authkey=authkey)
+    manager = JobQueueManager(address=address, authkey=authkey)
 
     manager.register('get_job_q', callable=Returner(job_q))
     manager.register('get_result_q', callable=Returner(result_q))
     manager.register('get_shutdown_e', callable=Returner(shutdown_e))
 
+    logging.info('Starting server at:')
     manager.start()
-    logging.info('Server started at port %s' % port)
     return manager
 
 class ServerQueueManager(SyncManager):
@@ -773,7 +767,7 @@ def main():
     if 'standalone' == option_mode:
         test_basic()
     elif 'server' == option_mode:
-        manager = make_server_manager(options['port'], options['auth'])
+        manager = make_server_manager((options['ip'], options['port']), options['auth'])
         shared_job_q = manager.get_job_q()
         shared_result_q = manager.get_result_q()
         shared_shutdown_e = manager.get_shutdown_e()
@@ -994,6 +988,139 @@ def test_fanout():
     print result
     pass
 
+
+def url_path_to_dict(path):
+    pattern = (r'^'
+               r'((?P<schema>.+?)://)?'
+               r'((?P<user>.+?)(:(?P<password>.*?))?@)?'
+               r'(?P<host>.*?)'
+               r'(:(?P<port>\d+?))?'
+               r'(?P<path>/.*?)?'
+               r'(?P<query>[?].*?)?'
+               r'$'
+               )
+    regex = re.compile(pattern)
+    m = regex.match(path)
+    d = m.groupdict() if m is not None else None
+
+    return d
+
+def test_url_path_to_dict():
+    d = url_path_to_dict('host')
+    assert 'host' == d['host']
+
+    d = url_path_to_dict('s3://host')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert None == d['path']
+
+    d = url_path_to_dict('s3://host/')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert '/' == d['path']
+
+    d = url_path_to_dict('s3://host/loc/ation')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert '/loc/ation' == d['path']
+   
+    d = url_path_to_dict('s3://host/loc/ation?param1=a&param2=b')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert '/loc/ation' == d['path']
+   
+    d = url_path_to_dict('host/loc/ation?param1=a&param2=b')
+    assert 'host' == d['host']
+    assert None == d['schema']
+    assert '/loc/ation' == d['path']
+   
+    d = url_path_to_dict('file:///C:/$RECYCLE.BIN/')
+    assert '' == d['host']
+    assert 'file' == d['schema']
+    assert '/C:/$RECYCLE.BIN/' == d['path']
+
+    d = url_path_to_dict('s3://igor@host/loc/ation?param1=a&param2=b')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert '/loc/ation' == d['path']
+    assert 'igor' == d['user']
+   
+    d = url_path_to_dict('s3://igor:okulist@host/loc/ation?param1=a&param2=b')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert '/loc/ation' == d['path']
+    assert 'igor' == d['user']
+    assert 'okulist' == d['password']
+   
+    d = url_path_to_dict('s3://igor:okulist@host:8080/loc/ation?param1=a&param2=b')
+    assert 'host' == d['host']
+    assert 's3' == d['schema']
+    assert '/loc/ation' == d['path']
+    assert 'igor' == d['user']
+    assert 'okulist' == d['password']
+    assert '8080' == d['port']
+
+    d = url_path_to_dict('s3://igor:okulist@sub2.sub1.host:8080/loc/ation?param1=a&param2=b')
+    assert 'sub2.sub1.host' == d['host']
+    assert 's3' == d['schema']
+    assert '/loc/ation' == d['path']
+    assert 'igor' == d['user']
+    assert 'okulist' == d['password']
+    assert '8080' == d['port']
+
+    #test data from http://mathiasbynens.be/demo/url-regex
+    should_work =[r'http://foo.com/blah_blah',
+    r'http://foo.com/blah_blah/',
+    r'http://foo.com/blah_blah_(wikipedia)',
+    r'http://foo.com/blah_blah_(wikipedia)_(again)',
+    r'http://www.example.com/wpstyle/?p=364',
+    r'https://www.example.com/foo/?bar=baz&inga=42&quux',
+    r'http://?df.ws/123',
+    r'http://userid:password@example.com:8080',
+    r'http://userid:password@example.com:8080/',
+    r'http://userid@example.com',
+    r'http://userid@example.com/',
+    r'http://userid@example.com:8080',
+    r'http://userid@example.com:8080/',
+    r'http://userid:password@example.com',
+    r'http://userid:password@example.com/',
+    r'http://142.42.1.1/',
+    r'http://142.42.1.1:8080/',
+    r'http://?.ws/?',
+    r'http://?.ws',
+    r'http://?.ws/',
+    r'http://foo.com/blah_(wikipedia)#cite-1',
+    r'http://foo.com/blah_(wikipedia)_blah#cite-1',
+    r'http://foo.com/unicode_(?)_in_parens',
+    r'http://foo.com/(something)?after=parens',
+    r'http://?.damowmow.com/',
+    r'http://code.google.com/events/#&product=browser',
+    r'http://j.mp',
+    r'ftp://foo.bar/baz',
+    r'http://foo.bar/?q=Test%20URL-encoded%20stuff',
+    r'http://????.??????',
+    r'http://??.??',
+    r'http://??????.???????',
+    r"http://-.~_!$&'()*+,;=:%40:80%2f::::::@example.com",
+    r'http://1337.net',
+    r'http://a.b-c.de',
+    r'http://223.255.255.254']
+
+    should_fail = []
+
+    for i in should_work:
+        d = url_path_to_dict(i)
+        assert d is not None
+
+    for i in should_fail:
+        d = url_path_to_dict(i)
+        assert d is None
+
+    #some more ideas at: 
+    # http://daringfireball.net/2010/07/improved_regex_for_matching_urls
+    
+    pass
+    
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()

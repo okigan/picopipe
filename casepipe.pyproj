@@ -14,9 +14,10 @@
     <Name>casepipe</Name>
     <RootNamespace>pycotest</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>-v --batch_mode cloud_cases_scan -s s3://s3_defacto/ --access_key AKIAIMQ7UOLLKVBPFSCQ --secret_key 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</CommandLineArguments>
+    <CommandLineArguments>-v -v --multiprocessing none</CommandLineArguments>
     <InterpreterPath />
     <InterpreterArguments />
+    <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
