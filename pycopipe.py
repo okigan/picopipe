@@ -897,9 +897,9 @@ def test_pool_results(start_client=True):
     #logger.setLevel(logging.DEBUG)
     logger.info('Staring')    
 
-    port = 65001
+    address = 'localhost', 65001
     authkey='hi'
-    manager = make_server_manager(port=port, authkey=authkey)
+    manager = make_server_manager(address=address, authkey=authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
 
@@ -912,7 +912,7 @@ def test_pool_results(start_client=True):
     client_p = None
     
     if True: 
-        client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':('localhost', port), 'authkey' : authkey})
+        client_p = multiprocessing.Process(target=run_client, args=(), kwargs={'address':address, 'authkey' : authkey})
         client_p.start()
 
     for pool in pools:
@@ -950,9 +950,9 @@ def test_job_resubmit(start_client=True):
     logger.setLevel(logging.DEBUG)
     logger.info('Staring')    
 
-    port = 65001
+    address = 'localhost', 65001
     authkey='hi'
-    manager = make_server_manager(port=port, authkey=authkey)
+    manager = make_server_manager(address=address, authkey=authkey)
     job_q = manager.get_job_q()
     result_q = manager.get_result_q()
     shutdown_e = manager.get_shutdown_e()
@@ -988,6 +988,16 @@ def test_fanout():
     print result
     pass
 
+def test_fanin():
+    pool = FakePool()
+    pool = multiprocessing.Pool(1)
+
+    results = []
+    for _ in xrange(10):
+        result = yield Sum((1,2,3))
+        results.append(result)
+
+    yield Sum(results)
 
 def url_path_to_dict(path):
     pattern = (r'^'
