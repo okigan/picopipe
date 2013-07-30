@@ -9,4 +9,5 @@ install:
     - sudo rm -rf /dev/shm && sudo ln -s /run/shm /dev/shm
 # command to run tests
 script:
-    - pycopipe.py --mode test --test_name_re "test_.*"
+    - chmod a+x pycopipe.py
+	- ./pycopipe.py --mode test --test_name_re "test_.*"
