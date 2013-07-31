@@ -11,4 +11,4 @@ install:
 script:
     - chmod a+x pycopipe.py
     - ls -la #debugging much ? 
-    - ./pycopipe.py --mode test --test_name_re "test_.*"
+    - ./pycopipe.py --mode test
