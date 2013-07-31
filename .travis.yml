@@ -10,4 +10,4 @@ install:
 # command to run tests
 script:
     - chmod a+x pycopipe.py
-	- ./pycopipe.py --mode test --test_name_re "test_.*"
+    - ./pycopipe.py --mode test --test_name_re "test_.*"
