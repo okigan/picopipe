@@ -8,7 +8,4 @@ install:
     #Temporal solution to travis issue #155
     - sudo rm -rf /dev/shm && sudo ln -s /run/shm /dev/shm
 # command to run tests
-script:
-    - chmod a+x pycopipe.py
-    - ls -la #debugging much ? 
-    - ./pycopipe.py
+script: python ./pycopipe.py --mode test

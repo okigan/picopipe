@@ -453,6 +453,7 @@ class Pipeline(object):
             state_changed = False
             state_changed_event.clear()
 
+            #TODO: do not iterate done nodes
             for node in processing_tree.iternodes():
                 if isinstance(node, FutureResult):
                     if node.state == FutureResultState.NEW:
@@ -468,7 +469,6 @@ class Pipeline(object):
                         
                     if node.state == FutureResultState.POPULATING:
                         async_result = node_to_async_result_map[node]
-                        #async_result.wait(1)
                         if async_result.ready() and async_result.successful():
                             results = async_result.get()
                             del node_to_async_result_map[node]
@@ -738,14 +738,14 @@ def main():
     import optparse
     
     parser = optparse.OptionParser()
-    parser.add_option('-v', '--verbose', dest='verbose', action='count')
-    parser.add_option('--logging_format'         , default='%(asctime)s.%(msecs)03d;%(levelname)s;%(message)s')
-    parser.add_option('--logging_datefmt'        , default='%Y-%m-%d %H:%M:%S')
-    parser.add_option('--mode', help='Mode of the script: standalone/server/client/test', default='standalone')
-    parser.add_option('--ip', help='IP of server', default='127.0.0.1')
-    parser.add_option('--port', default=65001, type=int)
-    parser.add_option('--auth', default='changeme')
-    parser.add_option('--test_name_re', default='test_basic')
+    parser.add_option('-v', '--verbose'     , dest='verbose', action='count')
+    parser.add_option('--logging_format'    , default='%(asctime)s.%(msecs)03d;%(levelname)s;%(message)s')
+    parser.add_option('--logging_datefmt'   , default='%Y-%m-%d %H:%M:%S')
+    parser.add_option('--mode'              , default='standalone', help='Mode of the script: standalone/server/client/test')
+    parser.add_option('--ip'                , default='127.0.0.1', help='IP of server')
+    parser.add_option('--port'              , default=65001, type=int)
+    parser.add_option('--auth'              , default='changeme')
+    parser.add_option('--test_name_re'      , default='test_basic')
 
     options_obj, args = parser.parse_args()
     
@@ -795,7 +795,8 @@ def main():
                 function = getattr(module, attrib)
                 if callable(function):
                     print 'Calling', attrib
-                    function()
+                    result = function()
+                    print 'Result', result
                     print 'Returned from', attrib
         return 0
     elif 'test_pool_server' == option_mode:
@@ -893,9 +894,9 @@ def test_pool_time():
 
 
 def test_pool_results(start_client=True):
-    logger = multiprocessing.log_to_stderr()
+    #logger = multiprocessing.log_to_stderr()
     #logger.setLevel(logging.DEBUG)
-    logger.info('Staring')    
+    logging.info('Staring')    
 
     address = 'localhost', 65001
     authkey='hi'
@@ -946,9 +947,9 @@ def test_pool_results(start_client=True):
     pass
 
 def test_job_resubmit(start_client=True):
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(logging.DEBUG)
-    logger.info('Staring')    
+    #logger = multiprocessing.log_to_stderr()
+    #logging.setLevel(logging.DEBUG)
+    logging.info('Staring')    
 
     address = 'localhost', 65001
     authkey='hi'
@@ -988,16 +989,46 @@ def test_fanout():
     print result
     pass
 
-def test_fanin():
-    pool = FakePool()
-    pool = multiprocessing.Pool(1)
+def test_fanin_sequential():
+    class SimpleFanin(Pipeline):
+        def run(self):
+            result1 = yield Sum(1,2,3)
+            time.sleep(1)
+            result2 = yield Sum(1,2,3)
+            time.sleep(1)
+            result3 = yield Sum(1,2,3)
+            time.sleep(1)
 
-    results = []
-    for _ in xrange(10):
-        result = yield Sum((1,2,3))
-        results.append(result)
+            yield Sum(result1, result2, result2)
 
-    yield Sum(results)
+
+    for pool in [FakePool(), multiprocessing.Pool(4)]:
+        t = SimpleFanin()
+        result = t.process()
+        assert 18 == result
+
+    return None
+
+def test_fanin_loop():
+    sub_pipeline_number = 30000
+
+    class Fanin(Pipeline):
+        def run(self):
+            results = []
+            for _ in xrange(sub_pipeline_number):
+                result = yield Sum(1,2,3)
+                results.append(result)
+
+            yield Sum(*results)
+
+
+    for pool in [multiprocessing.Pool(13)]:
+        t = Fanin()
+        result = t.process()
+        assert 6*sub_pipeline_number == result
+
+    return None
+
 
 def url_path_to_dict(path):
     pattern = (r'^'
